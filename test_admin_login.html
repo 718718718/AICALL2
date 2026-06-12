@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Test Company Admin Login</title>
+</head>
+<body>
+    <h1>Test Company Admin Login</h1>
+    <div>
+        <h2>Step 1: Login</h2>
+        <button onclick="testLogin()">Test Login</button>
+        <div id="loginResult"></div>
+    </div>
+    
+    <div>
+        <h2>Step 2: Check Admin Access</h2>
+        <button onclick="testAdminAccess()">Test Admin Access</button>
+        <div id="adminResult"></div>
+    </div>
+
+    <script>
+        let token = null;
+        
+        async function testLogin() {
+            const loginResult = document.getElementById('loginResult');
+            
+            try {
+                const response = await fetch('http://localhost:5001/api/auth/login', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        email: 'admin@test.com',
+                        password: 'password123'
+                    })
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok) {
+                    token = data.token;
+                    loginResult.innerHTML = `<div style="color: green;">
+                        <p>Login successful!</p>
+                        <p>Token: ${token.substring(0, 20)}...</p>
+                        <p>User: ${data.data.firstName} ${data.data.lastName}</p>
+                        <p>Email: ${data.data.email}</p>
+                        <p>Company: ${data.data.companyName}</p>
+                    </div>`;
+                } else {
+                    loginResult.innerHTML = `<div style="color: red;">Login failed: ${data.error}</div>`;
+                }
+            } catch (error) {
+                loginResult.innerHTML = `<div style="color: red;">Error: ${error.message}</div>`;
+            }
+        }
+        
+        async function testAdminAccess() {
+            const adminResult = document.getElementById('adminResult');
+            
+            if (!token) {
+                adminResult.innerHTML = '<div style="color: red;">Please login first</div>';
+                return;
+            }
+            
+            try {
+                const response = await fetch('http://localhost:5001/api/company-admin/dashboard-stats', {
+                    headers: {
+                        'Authorization': `Bearer ${token}`
+                    }
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok) {
+                    adminResult.innerHTML = `<div style="color: green;">
+                        <p>Admin access successful!</p>
+                        <p>Company: ${data.data.companyInfo.name}</p>
+                        <p>Total Users: ${data.data.stats.totalUsers}</p>
+                        <p>Total Calls: ${data.data.stats.totalCalls}</p>
+                    </div>`;
+                } else {
+                    adminResult.innerHTML = `<div style="color: red;">
+                        <p>Admin access failed (Status: ${response.status})</p>
+                        <p>Error: ${data.error}</p>
+                    </div>`;
+                }
+            } catch (error) {
+                adminResult.innerHTML = `<div style="color: red;">Error: ${error.message}</div>`;
+            }
+        }
+    </script>
+</body>
+</html>

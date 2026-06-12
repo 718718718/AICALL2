@@ -1,0 +1,11 @@
+名前,電話番号,メールアドレス,会社名,備考
+田中太郎,09012345678,tanaka@example.com,株式会社ABC,既存顧客
+佐藤花子,08098765432,sato@example.com,有限会社XYZ,見込み客
+鈴木一郎,07011112222,suzuki@example.com,合同会社DEF,VIP顧客
+高橋美咲,09033334444,takahashi@example.com,株式会社GHI,新規顧客
+山田次郎,08055556666,yamada@example.com,有限会社JKL,休眠顧客
+渡辺優子,07077778888,watanabe@example.com,株式会社MNO,アクティブ
+伊藤健太,09099990000,ito@example.com,合同会社PQR,検討中
+中村真理,08011223344,nakamura@example.com,有限会社STU,フォローアップ必要
+小林達也,07055667788,kobayashi@example.com,株式会社VWX,契約済み
+加藤美穂,09044556677,kato@example.com,合同会社YZA,リード

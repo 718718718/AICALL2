@@ -1,0 +1,27 @@
+[
+  {
+    "index": 1,
+    "timestamp": "2025-12-08T03:23:03.724Z",
+    "speaker": "customer"
+  },
+  {
+    "index": 2,
+    "timestamp": "2025-12-08T03:23:06.962Z",
+    "speaker": "ai"
+  },
+  {
+    "index": 3,
+    "timestamp": "2025-12-08T03:23:26.780Z",
+    "speaker": "customer"
+  },
+  {
+    "index": 4,
+    "timestamp": "2025-12-08T03:23:31.450Z",
+    "speaker": "ai"
+  },
+  {
+    "index": 5,
+    "timestamp": "2025-12-08T03:23:55.621Z",
+    "speaker": "ai"
+  }
+]

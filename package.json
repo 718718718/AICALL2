@@ -1,0 +1,17 @@
+{
+  "name": "ai-call-system",
+  "version": "1.0.0",
+  "description": "AI-powered call system. Backend deploys to Render, frontend deploys to Vercel.",
+  "scripts": {
+    "build": "cd backend && npm install",
+    "start": "cd backend && node server.js",
+    "postinstall": "cd backend && npm install",
+    "install-all": "cd backend && npm install && cd ../frontend && npm install",
+    "dev:backend": "cd backend && npm run dev",
+    "dev:frontend": "cd frontend && npm run dev",
+    "check-config": "node scripts/check-startup-config.js"
+  },
+  "keywords": ["ai", "call", "system", "twilio", "voice"],
+  "author": "AI Call System",
+  "license": "MIT"
+}

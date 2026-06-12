@@ -1,0 +1,4 @@
+customer,address,url,phone,email,company,notes
+田中一郎,東京都渋谷区渋谷1-2-3,https://techcorp.example.com,03-1234-5678,tanaka@techcorp.co.jp,株式会社テックコーポレーション,IT企業の代表取締役。新規サービスに興味あり
+佐藤花子,大阪府大阪市北区梅田2-3-4,https://designstudio.example.jp,06-9876-5432,sato@designstudio.jp,デザインスタジオ合同会社,デザイン事務所経営。ブランディング相談希望
+鈴木健太,愛知県名古屋市中区栄3-4-5,https://suzuki-mfg.example.com,052-5555-1234,suzuki@manufacturing.com,鈴木製作所株式会社,製造業。業務効率化ツール導入検討中

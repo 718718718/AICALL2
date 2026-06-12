@@ -1,0 +1,204 @@
+const axios = require('axios');
+const fs = require('fs').promises;
+const path = require('path');
+const crypto = require('crypto');
+const { getPublicBaseUrl } = require('../utils/publicUrl');
+
+/**
+ * CartesiaService — HTTP TTS via Cartesia /tts/bytes endpoint
+ *
+ * インターフェースは coefontService と完全互換：
+ *   - generateSpeechUrl(text)        : audio URL を返す（失敗時 null）
+ *   - getTwilioPlayElement(twiml, text) : twiml に <Play> を追加、失敗時 Polly fallback
+ *   - getAvailableVoices()           : 利用可能 voice 一覧
+ *   - clearCache()                   : キャッシュクリア
+ *
+ * 既存 coefontService の呼び出し側はそのまま使えるよう設計。
+ */
+class CartesiaService {
+  constructor() {
+    this.apiKey = process.env.CARTESIA_API_KEY;
+    this.voiceId = process.env.CARTESIA_VOICE_ID || 'fd1ee8f5-223a-4a87-a2fe-37eb3706cd69';
+    this.modelId = process.env.CARTESIA_MODEL_ID || 'sonic-3';
+    this.apiVersion = process.env.CARTESIA_API_VERSION || '2026-03-01';
+    this.language = process.env.CARTESIA_LANGUAGE || 'ja';
+    // Speed: sonic-3 accepts numeric 0.6 - 2.0 (default 1.0). Invalid → ignore and use Cartesia default.
+    const rawSpeed = parseFloat(process.env.CARTESIA_SPEED);
+    this.speed = !isNaN(rawSpeed) && rawSpeed >= 0.6 && rawSpeed <= 2.0 ? rawSpeed : null;
+    this.baseUrl = 'https://api.cartesia.ai';
+    this.cacheDir = path.join(__dirname, '../cache/audio');
+    this.initCache();
+
+    console.log('[Cartesia] Service initialized');
+    console.log('[Cartesia] API Key:', this.apiKey ? `${this.apiKey.substring(0, 10)}...` : 'Not set');
+    console.log('[Cartesia] Voice ID:', this.voiceId);
+    console.log('[Cartesia] Model:', this.modelId);
+    console.log('[Cartesia] API Version:', this.apiVersion);
+    console.log('[Cartesia] Speed:', this.speed !== null ? this.speed : 'default (1.0)');
+  }
+
+  async initCache() {
+    try {
+      await fs.mkdir(this.cacheDir, { recursive: true });
+    } catch (error) {
+      console.error('[Cartesia] Failed to create cache directory:', error);
+    }
+  }
+
+  /**
+   * テキストから WAV を生成し、URL を返す。
+   * 既に同じ text + voiceId + model のキャッシュがあればそれを返す。
+   * 8kHz / 16-bit PCM linear / mono WAV — Twilio <Play> 互換。
+   */
+  async generateSpeechUrl(text) {
+    try {
+      if (!this.apiKey) {
+        console.error('[Cartesia] CARTESIA_API_KEY is not set');
+        return null;
+      }
+
+      const cacheKey = crypto
+        .createHash('md5')
+        .update(`${text}|${this.voiceId}|${this.modelId}|${this.speed ?? 'default'}`)
+        .digest('hex');
+      const cacheFile = path.join(this.cacheDir, `${cacheKey}.wav`);
+
+      try {
+        await fs.access(cacheFile);
+        console.log(`[Cartesia] Using cached audio for: "${text.substring(0, 30)}..."`);
+        const baseUrl = getPublicBaseUrl();
+        if (!baseUrl) {
+          console.warn('[Cartesia] No public BASE_URL/BASE_URL_PROD configured — cannot serve cached URL, falling back to Polly');
+          return null;
+        }
+        return `${baseUrl}/api/audio/cache/${cacheKey}.wav`;
+      } catch {
+        // cache miss → fall through
+      }
+
+      console.log(`[Cartesia] Generating speech for: "${text}"`);
+
+      const requestBody = {
+        model_id: this.modelId,
+        transcript: text,
+        voice: { mode: 'id', id: this.voiceId },
+        output_format: {
+          container: 'wav',
+          encoding: 'pcm_s16le',
+          sample_rate: 8000
+        },
+        language: this.language
+      };
+      if (this.speed !== null) {
+        requestBody.speed = this.speed;
+      }
+
+      const response = await axios.post(
+        `${this.baseUrl}/tts/bytes`,
+        requestBody,
+        {
+          headers: {
+            'Content-Type': 'application/json',
+            'X-API-Key': this.apiKey,
+            'Cartesia-Version': this.apiVersion
+          },
+          responseType: 'arraybuffer',
+          timeout: 15000
+        }
+      );
+
+      if (response.data && response.data.byteLength > 0) {
+        await fs.writeFile(cacheFile, response.data);
+        console.log(`[Cartesia] Audio cached (${response.data.byteLength} bytes): ${cacheFile}`);
+        const baseUrl = getPublicBaseUrl();
+        if (!baseUrl) {
+          console.warn('[Cartesia] No public BASE_URL/BASE_URL_PROD configured — cannot return URL, falling back to Polly');
+          return null;
+        }
+        return `${baseUrl}/api/audio/cache/${cacheKey}.wav`;
+      }
+
+      throw new Error('No audio data returned from Cartesia API');
+    } catch (error) {
+      console.error('[Cartesia] Error generating speech:', error.message);
+      if (error.response) {
+        console.error('[Cartesia] Status:', error.response.status);
+        try {
+          const body = Buffer.isBuffer(error.response.data)
+            ? error.response.data.toString('utf8')
+            : error.response.data;
+          console.error('[Cartesia] Body:', body);
+        } catch (_) {}
+      }
+      return null;
+    }
+  }
+
+  /**
+   * Twilio TwiML に <Play> 要素を追加。失敗時は Polly.Mizuki にフォールバック。
+   * coefontService と同じシグネチャ。
+   */
+  async getTwilioPlayElement(twiml, text) {
+    try {
+      console.log(`[Cartesia] Processing text: "${text ? text.substring(0, 50) : 'empty'}..."`);
+
+      if (!text || text.trim() === '') {
+        console.warn('[Cartesia] WARNING: Empty or null text provided');
+        return false;
+      }
+
+      const audioUrl = await this.generateSpeechUrl(text);
+
+      if (audioUrl) {
+        console.log(`[Cartesia] Using Cartesia audio URL: ${audioUrl}`);
+        twiml.play(audioUrl);
+        return true;
+      }
+
+      console.log('[Cartesia] Falling back to Polly.Mizuki');
+      twiml.say({ voice: 'Polly.Mizuki', language: 'ja-JP' }, text);
+      return false;
+    } catch (error) {
+      console.error('[Cartesia] ERROR in getTwilioPlayElement:', error);
+      twiml.say({ voice: 'Polly.Mizuki', language: 'ja-JP' }, text);
+      return false;
+    }
+  }
+
+  /**
+   * 利用可能 voice 一覧（CoeFont の互換 API）。
+   * Cartesia は GET /voices で取得可能。
+   */
+  async getAvailableVoices() {
+    try {
+      if (!this.apiKey) return [];
+      const response = await axios.get(`${this.baseUrl}/voices`, {
+        headers: {
+          'X-API-Key': this.apiKey,
+          'Cartesia-Version': this.apiVersion
+        },
+        timeout: 10000
+      });
+      return Array.isArray(response.data) ? response.data : [];
+    } catch (error) {
+      console.error('[Cartesia] Error fetching voices:', error.message);
+      return [];
+    }
+  }
+
+  async clearCache() {
+    try {
+      const files = await fs.readdir(this.cacheDir);
+      for (const file of files) {
+        if (file.endsWith('.wav') || file.endsWith('.mp3')) {
+          await fs.unlink(path.join(this.cacheDir, file));
+        }
+      }
+      console.log('[Cartesia] Cache cleared');
+    } catch (error) {
+      console.error('[Cartesia] Error clearing cache:', error);
+    }
+  }
+}
+
+module.exports = new CartesiaService();
