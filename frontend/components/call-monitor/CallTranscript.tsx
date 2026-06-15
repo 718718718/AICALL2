@@ -36,13 +36,20 @@ export function CallTranscript({ callId, initialTranscript = [] }: CallTranscrip
     if (socket) {
       socket.on('transcript-update', (data: any) => {
         if (data.callId === callId) {
-          setTranscript(prev => [...prev, {
-            timestamp: data.timestamp || new Date().toISOString(),
-            speaker: data.speaker,
-            message: data.message,
-            confidence: data.confidence,
-            isPlaying: data.isPlaying
-          }]);
+          setTranscript(prev => {
+            const newEntry = {
+              timestamp: data.timestamp || new Date().toISOString(),
+              speaker: data.speaker,
+              message: data.message,
+              confidence: data.confidence,
+              isPlaying: data.isPlaying
+            };
+            const updated = [...prev, newEntry];
+            updated.sort((a, b) =>
+              new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+            );
+            return updated;
+          });
         }
       });
     }
