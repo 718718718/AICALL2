@@ -512,13 +512,11 @@ function extractTextFromContent(content) {
 /**
  * Send conversation update via WebSocket (memory storage only)
  */
-function sendConversationUpdate(callSession, role, text) {
+function sendConversationUpdate(callSession, role, text, timestamp = new Date()) {
   if (!text || !global.io) return;
 
   const speaker = role === 'assistant' ? 'ai' : role === 'user' ? 'customer' : 'system';
   const phoneNumber = callSession.phoneNumber;
-  const timestamp = new Date();
-
   // トランスクリプトをメモリに保存（通話終了時にDBに一括保存）
   if (!callSession.transcript) {
     callSession.transcript = [];
@@ -1188,8 +1186,10 @@ exports.handleMediaStream = async (twilioWs, req) => {
   let customerSilenceTimer = null;
   let customerSilenceCheckCount = 0;  // 0, 1, or 2 (for first, second check)
 
-  // CallSession reference (will be loaded later)
+   // CallSession reference (will be loaded later)
   let callSession = null;
+  // 顧客発話開始時刻（STT完了時刻との差を補正するため）
+  let speechStartedAt = null;
 
   function completeHandoff(reason) {
     if (handoffCompleted) return;
@@ -1685,6 +1685,7 @@ exports.handleMediaStream = async (twilioWs, req) => {
         //     4. drop any pending hangup tied to that context
         if (response.type === 'input_audio_buffer.speech_started') {
           console.log('[barge-in] speech_started');
+          speechStartedAt = new Date(); // 発話開始時刻を記録
 
           const shouldInterrupt =
             playback.isAiResponseActive() ||
@@ -1800,8 +1801,9 @@ exports.handleMediaStream = async (twilioWs, req) => {
             await callSession.save();
             console.log('[User Transcription] Saved to database');
 
-            // Send via WebSocket
-            sendConversationUpdate(callSession, 'user', transcript);
+            // Send via WebSocket（発話開始時刻を使用、なければ現在時刻）
+            sendConversationUpdate(callSession, 'user', transcript, speechStartedAt || new Date());
+            speechStartedAt = null; // リセット
           }
         }
 
