@@ -585,18 +585,21 @@ async function initializeSession(openaiWs, agentSettings) {
       output_modalities: ["text"],
       audio: {
         input: {
-          format: { type: "audio/pcmu" },
-          turn_detection: {
-            type: "server_vad",
-            threshold: 0.4,
-            prefix_padding_ms: 200,
-            silence_duration_ms: 400
-          },
-          transcription: {
-            model: "whisper-1",
-            language: "ja"
+            format: { type: "audio/pcmu" },
+            noise_reduction: {
+              type: "near_field"
+            },
+            turn_detection: {
+              type: "server_vad",
+              threshold: 0.4,
+              prefix_padding_ms: 200,
+              silence_duration_ms: 400
+            },
+            transcription: {
+              model: "whisper-1",
+              language: "ja"
+            }
           }
-        }
       },
       instructions: instructions,
       tools: [
