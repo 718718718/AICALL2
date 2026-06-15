@@ -596,7 +596,7 @@ async function initializeSession(openaiWs, agentSettings) {
               silence_duration_ms: 400
             },
             transcription: {
-              model: "whisper-1",
+              model: "gpt-4o-transcribe",
               language: "ja"
             }
           }
