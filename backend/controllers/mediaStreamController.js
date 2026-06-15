@@ -203,7 +203,17 @@ async function executeAutoCallEnd(callSession, functionCallId, args) {
     let finalNotes = args.rejection_reason ? `AI判断による切電: ${args.rejection_reason}` : 'AI判断による切電';
 
     // 不在判定キーワード
-    const absentKeywords = ['不在', '外出', '外出中', '席を外して', '席を外しております', '会議中', '休み', '戻り', '退職', '離席', 'いません', 'でかけています'];
+    const absentKeywords = [
+      '不在', '外出', '外出中',
+      '席を外して', '席を外しております', '席を外してい',
+      '会議中', '会議に', '会議で',
+      '休み', '本日休', 'お休み', 'お休みを',
+      '戻り', 'ただいま外', 
+      '退職', '離席',
+      'いません', 'おりません', 'ございません',
+      'でかけています', 'でかけております',
+      '手が離せ', '対応できません', '出張'
+    ];
 
     // Step 1: AIの引数をチェック（従来ロジック）
     const reasonText = args.rejection_reason || '';
@@ -672,7 +682,7 @@ async function initializeSession(openaiWs, agentSettings) {
         {
           type: "function",
           name: "end_call_on_absent",
-          description: "担当者が不在、外出中、会議中などで電話に出られないことが確認できた時に使用する。戻り時間の確認などは行わず、丁寧に挨拶して終了する。「席を外しております」「外出しております」「本日は休みです」「退職しました」などの発言を検知した時のみ呼び出す。",
+          description: "担当者が不在・外出・会議中・休暇・退職などで電話に出られないことが確認できた時に使用する。以下のキーワードを検知した時は必ずこの関数を呼び出す（end_call_on_rejectionではなく）：「席を外しております」「外出しております」「外出中です」「会議中です」「本日は休みです」「お休みをいただいております」「退職しました」「おりません」「ございません」「でかけております」「出張中」「手が離せません」。重要：不在・外出・会議・休暇・退職は必ずこの関数を使うこと。end_call_on_rejectionと混同しないこと。",
           parameters: {
             type: "object",
             properties: {
