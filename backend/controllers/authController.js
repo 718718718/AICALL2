@@ -3,6 +3,7 @@ const Company = require('../models/Company');
 const EmailVerification = require('../models/EmailVerification');
 const PasswordReset = require('../models/PasswordReset');
 const emailService = require('../services/emailService');
+const { isSkipEmailVerification } = require('../utils/skipEmailVerification');
 const jwt = require('jsonwebtoken');
 const asyncHandler = require('../middlewares/asyncHandler');
 const crypto = require('crypto');
@@ -639,6 +640,86 @@ exports.verifyEmailCode = asyncHandler(async (req, res, next) => {
       error: 'サーバーエラーが発生しました',
     });
   }
+});
+
+// @desc    Create registration token without email verification (dev/test only)
+// @route   POST /api/auth/create-registration-token
+// @access  Public
+exports.createRegistrationToken = asyncHandler(async (req, res) => {
+  if (!isSkipEmailVerification()) {
+    return res.status(403).json({
+      success: false,
+      error: 'この操作は開発・テスト環境でのみ利用できます',
+    });
+  }
+
+  const {
+    email,
+    companyId,
+    companyName,
+    businessName,
+    businessPhone,
+    address,
+    businessType,
+    employees,
+    description,
+    companyData,
+  } = req.body;
+
+  if (!email || !companyId) {
+    return res.status(400).json({
+      success: false,
+      error: 'メールアドレスと企業IDが必要です',
+    });
+  }
+
+  const processedCompanyData = companyData || {
+    companyName,
+    businessName,
+    businessPhone,
+    address,
+    businessType,
+    employees,
+    description,
+  };
+
+  const company = await Company.findOne({ companyId, status: 'active' });
+  if (!company) {
+    return res.status(400).json({
+      success: false,
+      error: '無効な企業IDです',
+    });
+  }
+
+  const existingUser = await User.findOne({ email });
+  if (existingUser) {
+    return res.status(400).json({
+      success: false,
+      error: 'このメールアドレスは既に使用されています',
+    });
+  }
+
+  const tempToken = jwt.sign(
+    {
+      email,
+      companyId,
+      companyData: processedCompanyData,
+      type: 'email_verified',
+    },
+    process.env.JWT_SECRET,
+    { expiresIn: '30m' }
+  );
+
+  console.log('[Auth] Email verification skipped (dev/test), token issued for:', email);
+
+  res.status(200).json({
+    success: true,
+    message: 'メール認証をスキップしました（開発・テスト環境）',
+    data: {
+      tempToken,
+      email,
+    },
+  });
 });
 
 // @desc    Complete registration after email verification

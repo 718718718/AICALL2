@@ -16,7 +16,8 @@ import {
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { ExclamationTriangleIcon } from "@radix-ui/react-icons";
 import { Loader2 } from "lucide-react";
-import { env } from "process";
+import { getApiUrl } from "@/lib/apiHelper";
+import { isSkipEmailVerification } from "@/lib/signupConfig";
 
 type FormData = {
   companyId: string;
@@ -87,6 +88,7 @@ export default function SignupPage() {
   });
   
   const router = useRouter();
+  const skipEmailVerification = isSkipEmailVerification();
 
   // カウントダウンタイマーの実装
   useEffect(() => {
@@ -320,6 +322,56 @@ export default function SignupPage() {
     }
   };
 
+  // 開発・テスト環境: メール認証をスキップして登録トークンを取得
+  const proceedWithoutEmailVerification = async () => {
+    if (!validateStep(2)) return;
+
+    setEmailVerification(prev => ({ ...prev, isLoading: true, error: null }));
+    setSubmitError(null);
+
+    const email = formData.email.trim();
+
+    try {
+      const response = await fetch(getApiUrl('/api/auth/create-registration-token'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email,
+          companyId: formData.companyId,
+          companyName: formData.companyName,
+          businessName: formData.businessName,
+          businessPhone: formData.businessPhone,
+          address: formData.address,
+          businessType: formData.businessType,
+          employees: formData.employees,
+          description: formData.annualRevenue || '',
+        }),
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.error || data.message || 'アカウント作成の準備に失敗しました');
+      }
+
+      setEmailVerification({
+        step: 'completed',
+        token: data.data.tempToken,
+        countdown: 0,
+        resendCooldown: 0,
+        isLoading: false,
+        error: null,
+      });
+
+      setFormData(prev => ({ ...prev, verificationEmail: email }));
+      setStep(5);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'アカウント作成の準備中にエラーが発生しました';
+      setEmailVerification(prev => ({ ...prev, error: message, isLoading: false }));
+      setSubmitError(message);
+    }
+  };
+
   const validateStep = (step: number): boolean => {
     const newErrors: FormErrors = {};
 
@@ -400,6 +452,11 @@ export default function SignupPage() {
   };
 
   const handleNext = () => {
+    if (step === 2 && skipEmailVerification) {
+      proceedWithoutEmailVerification();
+      return;
+    }
+
     if (!validateStep(step)) return;
 
     if (step < 5) {
@@ -412,7 +469,17 @@ export default function SignupPage() {
   const handleBack = () => {
     setSubmitError(null);
     if (step > 1) {
-      setStep(step - 1);
+      if (skipEmailVerification && step === 5) {
+        setStep(2);
+        setEmailVerification(prev => ({
+          ...prev,
+          step: 'email',
+          token: '',
+          error: null,
+        }));
+      } else {
+        setStep(step - 1);
+      }
     }
   };
 
@@ -427,21 +494,18 @@ export default function SignupPage() {
         return;
       }
 
-      const response = await fetch(
-        `${process.env.NODE_ENV === 'production' ? process.env.NEXT_PUBLIC_BACKEND_URL_PROD! : (process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:5000')}/api/auth/complete-registration`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            firstName: formData.firstName.trim(),
-            lastName: formData.lastName.trim(),
-            password: formData.password.trim(),
-            tempToken: emailVerification.token
-          }),
-        }
-      );
+      const response = await fetch(getApiUrl('/api/auth/complete-registration'), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          firstName: formData.firstName.trim(),
+          lastName: formData.lastName.trim(),
+          password: formData.password.trim(),
+          tempToken: emailVerification.token,
+        }),
+      });
 
       const data = await response.json();
 
@@ -478,7 +542,7 @@ export default function SignupPage() {
     } finally {
       setIsSubmitting(false);
     }
-  };;
+  };
 
   const updateFormData = (field: keyof FormData, value: string) => {
     setFormData((prev) => ({ ...prev, [field]: value }));
@@ -552,6 +616,15 @@ export default function SignupPage() {
     <div className="min-h-screen bg-gray-50 flex items-center justify-center p-4">
       <div className="w-full max-w-2xl">
 
+        {skipEmailVerification && (
+          <Alert className="mb-4 border-amber-200 bg-amber-50">
+            <AlertTitle>開発・テストモード</AlertTitle>
+            <AlertDescription>
+              メール認証はスキップされます。企業情報入力後、直接アカウントを作成できます。
+            </AlertDescription>
+          </Alert>
+        )}
+
         {submitError && (
           <Alert variant="destructive" className="mb-4">
             <ExclamationTriangleIcon className="h-4 w-4" />
@@ -565,8 +638,8 @@ export default function SignupPage() {
             <CardTitle>
               {step === 1 && "企業情報を探す"}
               {step === 2 && "企業情報を入力"}
-              {step === 3 && "新規アカウント作成"}
-              {step === 4 && "認証コードの入力"}
+              {step === 3 && !skipEmailVerification && "新規アカウント作成"}
+              {step === 4 && !skipEmailVerification && "認証コードの入力"}
               {step === 5 && "アカウント情報入力"}
             </CardTitle>
           </CardHeader>
@@ -650,7 +723,7 @@ export default function SignupPage() {
                   )}
                 </div>
                 <div className="space-y-2">
-                  <Label htmlFor="email">企業メールアドレス</Label>
+                  <Label htmlFor="email">メールアドレス *</Label>
                   <Input
                     id="email"
                     type="email"
@@ -941,6 +1014,8 @@ export default function SignupPage() {
                       "認証する"
                     ) : step === 5 ? (
                       "登録完了"
+                    ) : step === 2 && skipEmailVerification ? (
+                      "アカウント情報入力へ"
                     ) : (
                       "次へ"
                     )}
