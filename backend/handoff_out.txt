@@ -1,4 +1,4 @@
-const asyncHandler = require('../middlewares/asyncHandler');
+﻿const asyncHandler = require('../middlewares/asyncHandler');
 const ErrorResponse = require('../utils/ErrorResponse');
 const CallSession = require('../models/CallSession');
 const Customer = require('../models/Customer');
@@ -650,22 +650,28 @@ exports.initiateHandoffByPhone = asyncHandler(async (req, res, next) => {
     
     const conferenceName = `handoff-${callSession._id}`;
     
-    // 1. 担当者に電話をかける（Polly直接使用でキャッシュ不要・高速化）
+    // 1. 担当者に電話をかける（CoeFont音声を使用）
     const agentMessage = 'お客様からのお電話です。接続します。';
-    const agentTwiml = `<Response>
-      <Say voice="Polly.Mizuki" language="ja-JP">${agentMessage}</Say>
-      <Dial>
-        <Conference
-          startConferenceOnEnter="true"
-          endConferenceOnExit="true"
-          record="record-from-start"
-          recordingStatusCallback="${getPublicBaseUrl()}/api/twilio/recording/status/${callId}"
-          recordingStatusCallbackMethod="POST"
-          statusCallback="${getPublicBaseUrl()}/api/twilio/conference/events/${callId}"
-          statusCallbackMethod="POST"
-          statusCallbackEvent="start end join leave mute hold">${conferenceName}</Conference>
-      </Dial>
-    </Response>`;else {
+    const agentAudioUrl = await coefontService.generateSpeechUrl(agentMessage);
+    
+    let agentTwiml;
+    if (agentAudioUrl) {
+      // CoeFontの音声URLを使用
+      agentTwiml = `<Response>
+        <Play>${agentAudioUrl}</Play>
+        <Dial>
+          <Conference
+            startConferenceOnEnter="true"
+            endConferenceOnExit="true"
+            record="record-from-start"
+            recordingStatusCallback="${getPublicBaseUrl()}/api/twilio/recording/status/${callSession._id}"
+            recordingStatusCallbackMethod="POST"
+            statusCallback="${getPublicBaseUrl()}/api/twilio/conference/events/${callSession._id}"
+            statusCallbackMethod="POST"
+            statusCallbackEvent="start end join leave mute hold">${conferenceName}</Conference>
+        </Dial>
+      </Response>`;
+    } else {
       // フォールバック: Polly.Mizukiを使用
       agentTwiml = `<Response>
         <Say voice="Polly.Mizuki" language="ja-JP">${agentMessage}</Say>
@@ -699,34 +705,30 @@ exports.initiateHandoffByPhone = asyncHandler(async (req, res, next) => {
     const fromNumber = assignedAgentUser.twilioPhoneNumber;
     console.log(`[Handoff] Using user's assigned number: ${fromNumber}`);
     
-    // 担当者への発信と顧客リダイレクトを並列実行（高速化）
-    const redirectUrl = `${getPublicBaseUrl()}/api/twilio/handoff-redirect/${callId}`;
-    const [agentCall] = await Promise.all([
-      client.calls.create({
-        to: agentPhoneNumber,
-        from: fromNumber,
-        twiml: agentTwiml,
-        timeout: 30,
-        statusCallback: `${getPublicBaseUrl()}/api/twilio/handoff-status/${callId}`,
-        statusCallbackEvent: ['no-answer', 'busy', 'failed', 'completed']
-      }),
-      callSession.twilioCallSid && callSession.twilioCallSid.startsWith('CA')
-        ? client.calls(callSession.twilioCallSid).update({ url: redirectUrl, method: 'POST' })
-        : Promise.resolve()
-    ]);
-    
+    const agentCall = await client.calls.create({
+      to: agentPhoneNumber,
+      from: fromNumber,
+      twiml: agentTwiml,
+      timeout: 30,
+      statusCallback: `${getPublicBaseUrl()}/api/twilio/handoff-status/${callSession._id}`,
+      statusCallbackEvent: ['no-answer', 'busy', 'failed', 'completed']
+    });
+
     console.log(`[Handoff] Agent call created: ${agentCall.sid}`);
-    
-    // 2. 顧客をConferenceに移動（並列処理済み）
+
+    // 2. 顧客をConferenceに移動
+    // Media Streams mode (<Connect><Stream>) では直接TwiML更新できないため、
+    // Redirectを使って新しいエンドポイントに誘導する
     if (callSession.twilioCallSid && callSession.twilioCallSid.startsWith('CA')) {
       console.log(`[Handoff] Moving customer to conference using Redirect`);
+
+      // Redirectエンドポイントを使用（Media Streams互換）
+      const redirectUrl = `${getPublicBaseUrl()}/api/twilio/handoff-redirect/${callSession._id}`;
+
       try {
-        console.log(`[Handoff] Customer redirected to: ${redirectUrl}`);
-      } catch (updateError) {
-        console.error(`[Handoff] Error updating call:`, updateError.message);
-        await CallSession.findByIdAndUpdate(callId, {
-          'handoffDetails.pendingConferenceName': conferenceName,
-          'handoffDetails.redirectUrl': redirectUrl
+        await client.calls(callSession.twilioCallSid).update({
+          url: redirectUrl,
+          method: 'POST'
         });
         console.log(`[Handoff] Customer redirected to: ${redirectUrl}`);
       } catch (updateError) {
