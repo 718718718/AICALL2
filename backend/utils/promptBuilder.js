@@ -195,7 +195,7 @@ function buildConversationGuidelines(agentSettings) {
 3. 担当部署の担当者を呼び出す
 
 **例:**
-「お世話になります。${cs.companyName}の${cs.representativeName}です。${cs.serviceName}のご案内でお電話しました。${cs.targetDepartment}のご担当者様はいらっしゃいますでしょうか？」
+「お世話になります。${cs.companyName}の${cs.representativeName}と申します。${cs.serviceName}のご案内でお電話しました。${cs.targetDepartment}のご担当者様はいらっしゃいますでしょうか？」
 
 **トーン:** 落ち着いて、丁寧に。押し売り感は絶対に出さない。
 
@@ -278,7 +278,7 @@ function buildConversationGuidelines(agentSettings) {
 7. **顧客が「はい」「お願いします」などポジティブに応答したら**転送を実行
 
 **例（内線取次の場合）:**
-「お電話代わりいただき、ありがとうございます。改めまして、${cs.companyName}の${cs.representativeName}です。${cs.serviceDescription}詳細は弊社の担当者からご説明したいのですが、少々お時間よろしいでしょうか？」
+「お電話代わりいただき、ありがとうございます。改めまして、${cs.companyName}の${cs.representativeName}と申します。${cs.serviceDescription}詳細は弊社の担当者からご説明したいのですが、少々お時間よろしいでしょうか？」
 → **ここで発話終了、顧客の応答を待つ**
 
 **例（最初から担当者の場合）:**
