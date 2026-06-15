@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Media Streams Controller for OpenAI Realtime API Integration
  * Based on: https://github.com/twilio-samples/speech-assistant-openai-realtime-api-python
  *
@@ -588,12 +588,7 @@ async function initializeSession(openaiWs, agentSettings) {
       audio: {
         input: {
           format: { type: "audio/pcmu" },
-          turn_detection: {
-            type: "server_vad",
-            threshold: 0.4,
-            prefix_padding_ms: 200,
-            silence_duration_ms: 400
-          },
+          turn_detection: { type: "server_vad" },
           transcription: {
             model: "whisper-1",
             language: "ja"
@@ -1599,15 +1594,6 @@ exports.handleMediaStream = async (twilioWs, req) => {
             cartesiaContextId = createCartesiaContextId(currentResponseId, response.item_id);
             playback.startContext(cartesiaContextId);
             console.log('[Text] New assistant item:', response.item_id, '→ Cartesia context:', cartesiaContextId);
-// ── フィラー挿入（2ターン目以降のみ）──
-            const FILLERS = ['はい。', 'そうですね。', 'なるほど。'];
-            const conversationLen = callSession?.realtimeConversation?.length || 0;
-            if (conversationLen >= 1 && !pendingHandoff && !pendingCallEnd) {
-              const filler = FILLERS[Math.floor(Math.random() * FILLERS.length)];
-              sendToCartesia(cartesiaWs, filler, cartesiaContextId, true);
-              console.log('[Filler] Inserted:', filler);
-            }
-            // ──────────────────────────────────────
 
             // While a handoff is awaiting its announcement (response B), bind the
             // pending hangup to the freshly-created announcement context. RE-BIND
