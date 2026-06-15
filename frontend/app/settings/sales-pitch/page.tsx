@@ -425,29 +425,6 @@ export default function SalesPitchSettingsPage() {
                   </div>
                 </div>
 
-                <div className="space-y-3">
-                  <Label>AIボイス</Label>
-                  <RadioGroup
-                    value={settings.voice}
-                    onValueChange={(value: 'alloy' | 'cedar' | 'coral') =>
-                      setSettings(prev => ({ ...prev, voice: value }))
-                    }
-                  >
-                    <div className="flex items-center space-x-2">
-                      <RadioGroupItem value="alloy" id="voice-alloy" />
-                      <Label htmlFor="voice-alloy" className="font-normal cursor-pointer">中性的で柔らかい</Label>
-                    </div>
-                    <div className="flex items-center space-x-2">
-                      <RadioGroupItem value="cedar" id="voice-cedar" />
-                      <Label htmlFor="voice-cedar" className="font-normal cursor-pointer">ハキハキと明瞭</Label>
-                    </div>
-                    <div className="flex items-center space-x-2">
-                      <RadioGroupItem value="coral" id="voice-coral" />
-                      <Label htmlFor="voice-coral" className="font-normal cursor-pointer">温かく友好的</Label>
-                    </div>
-                  </RadioGroup>
-                </div>
-
                 {/* 話す速度 */}
                 <div className="space-y-3">
                   <Label>話す速度</Label>
