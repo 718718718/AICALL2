@@ -10,7 +10,7 @@ const CallSession = require('../models/CallSession');
 const AgentSettings = require('../models/AgentSettings');
 const { buildOpenAIInstructions } = require('../utils/promptBuilder');
 
-const CARTESIA_VOICE_ID = process.env.CARTESIA_VOICE_ID || 'fd1ee8f5-223a-4a87-a2fe-37eb3706cd69';
+const CARTESIA_VOICE_ID_DEFAULT = process.env.CARTESIA_VOICE_ID || 'fd1ee8f5-223a-4a87-a2fe-37eb3706cd69';
 const CARTESIA_MODEL_ID = process.env.CARTESIA_MODEL_ID || 'sonic-3';
 const CARTESIA_API_VERSION = process.env.CARTESIA_API_VERSION || '2026-03-01';
 
@@ -1102,15 +1102,13 @@ exports.createPlaybackTracker = createPlaybackTracker;
  * - Use same contextId across one AI response, with continue: true for partial chunks
  * - Send continue: false (with empty text OK) to finalize generation
  */
-function sendToCartesia(cartesiaWs, text, contextId, continueFlag = false) {
-  // Allow empty text only when finalizing (continue: false)
+function sendToCartesia(cartesiaWs, text, contextId, continueFlag = false, voiceId = null) {
   if (continueFlag && (!text || !text.trim())) return;
 
   const payload = JSON.stringify({
     model_id: CARTESIA_MODEL_ID,
     transcript: (text || '').trim(),
-    voice: { mode: 'id', id: CARTESIA_VOICE_ID },
-    output_format: { container: 'raw', encoding: 'pcm_mulaw', sample_rate: 8000 },
+    voice: { mode: 'id', id: voiceId || CARTESIA_VOICE_ID_DEFAULT },    output_format: { container: 'raw', encoding: 'pcm_mulaw', sample_rate: 8000 },
     context_id: contextId,
     continue: continueFlag
   });
@@ -1386,6 +1384,8 @@ exports.handleMediaStream = async (twilioWs, req) => {
     }
 
     const temperature = agentSettings?.temperature || 0.8;
+    // Cartesia音声ID（AgentSettingsで設定された声を優先、なければ環境変数）
+    const cartesiaVoiceId = agentSettings?.cartesiaVoiceId || CARTESIA_VOICE_ID_DEFAULT;
     const openaiUrl = `wss://api.openai.com/v1/realtime?model=gpt-realtime&temperature=${temperature}`;
     console.log('[OpenAI] Connecting to:', openaiUrl);
     console.log('[OpenAI] API Key present:', !!process.env.OPENAI_REALTIME_API_KEY);
@@ -1604,7 +1604,7 @@ exports.handleMediaStream = async (twilioWs, req) => {
             const conversationLen = callSession?.realtimeConversation?.length || 0;
             if (conversationLen >= 1 && !pendingHandoff && !pendingCallEnd) {
               const filler = FILLERS[Math.floor(Math.random() * FILLERS.length)];
-              sendToCartesia(cartesiaWs, filler, cartesiaContextId, true);
+              sendToCartesia(cartesiaWs, filler, cartesiaContextId, true, cartesiaVoiceId);
               console.log('[Filler] Inserted:', filler);
             }
             // ──────────────────────────────────────
@@ -1653,7 +1653,7 @@ exports.handleMediaStream = async (twilioWs, req) => {
           // actual audio queued at Twilio, not text frames sent upstream.
           const sentenceEnd = /[。！？!?]\s*$/.test(textBuffer) && textBuffer.length >= 10;
           if (sentenceEnd || textBuffer.length >= 150) {
-            sendToCartesia(cartesiaWs, textBuffer, cartesiaContextId, true /* continue */);
+            sendToCartesia(cartesiaWs, textBuffer, cartesiaContextId, true /* continue */, cartesiaVoiceId);
             textBuffer = '';
           }
         }

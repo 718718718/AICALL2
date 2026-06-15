@@ -1,4 +1,4 @@
-const mongoose = require('mongoose');
+﻿const mongoose = require('mongoose');
 
 const AgentSettingsSchema = new mongoose.Schema({
   userId: { 
@@ -178,16 +178,6 @@ const AgentSettingsSchema = new mongoose.Schema({
     default: 0,
     min: 0,
     max: 100
-  },
-// Cartesia TTS 音声設定
-  cartesiaVoiceId: {
-    type: String,
-    default: null  // nullの場合は環境変数CARTESIA_VOICE_IDを使用
-  },
-  cartesiaVoiceGender: {
-    type: String,
-    enum: ['female', 'male'],
-    default: 'female'
   },
   // OpenAI Realtime API settings
   voice: {
