@@ -12,6 +12,7 @@ import { Badge } from "@/components/ui/badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { X, UserPlus, Phone, Mic, Volume2, Loader2 } from "lucide-react";
 import { io, Socket } from "socket.io-client";
+import { getWsUrl } from "@/lib/config";
 
 interface CallStatusModalProps {
   isOpen: boolean;
@@ -115,7 +116,7 @@ export function CallStatusModal({
 
       // Initialize socket connection
       const initializeSocket = async () => {
-        const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:5000";
+        const wsUrl = getWsUrl();
         let token = localStorage.getItem('accessToken');
 
         if (!token) {
@@ -126,7 +127,7 @@ export function CallStatusModal({
           }
         }
 
-        const newSocket = io(backendUrl, {
+        const newSocket = io(wsUrl, {
           transports: ["websocket"],
           auth: { token }
         });

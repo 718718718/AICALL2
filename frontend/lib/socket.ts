@@ -1,4 +1,5 @@
 import { io, Socket } from 'socket.io-client';
+import { getWsUrl } from './config';
 
 let socket: Socket | null = null;
 
@@ -7,7 +8,7 @@ export const initializeSocket = (token?: string): Socket => {
     return socket;
   }
 
-  const SOCKET_URL = process.env.NEXT_PUBLIC_SOCKET_URL || 'http://localhost:5000';
+  const SOCKET_URL = getWsUrl();
 
   // 開発環境では認証をオプショナルに
   const authConfig = token ? { auth: { token } } : {};

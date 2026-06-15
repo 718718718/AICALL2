@@ -1,5 +1,16 @@
 import { io, Socket } from "socket.io-client";
 
+/** Socket.io expects http(s); normalize ws(s) scheme from NEXT_PUBLIC_WS_URL. */
+function resolveWsUrl(): string {
+  const raw =
+    process.env.NEXT_PUBLIC_WS_URL ||
+    (process.env.NODE_ENV === 'production'
+      ? process.env.NEXT_PUBLIC_WS_URL_PROD
+      : process.env.NEXT_PUBLIC_WS_URL_DEV) ||
+    'ws://localhost:5000';
+  return raw.replace(/^wss:\/\//i, 'https://').replace(/^ws:\/\//i, 'http://');
+}
+
 export interface TranscriptEntry {
   speaker: "AI" | "Customer" | "System";
   text: string;
@@ -22,7 +33,7 @@ class WebSocketConnectionManager implements WebSocketManager {
   private maxReconnectAttempts: number = 5;
 
   private constructor() {
-    this.backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:5000";
+    this.backendUrl = resolveWsUrl();
   }
 
   public static getInstance(): WebSocketConnectionManager {

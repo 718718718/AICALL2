@@ -3,6 +3,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { io, Socket } from "socket.io-client";
+import { getWsUrl } from "@/lib/config";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -605,9 +606,7 @@ export default function DashboardPage() {
     };
 
     const initializeSocket = async () => {
-      const wsUrl = process.env.NODE_ENV === 'production'
-        ? process.env.NEXT_PUBLIC_BACKEND_URL_PROD!
-        : 'http://localhost:5000';
+      const wsUrl = getWsUrl();
 
       let token = localStorage.getItem('accessToken');
 
