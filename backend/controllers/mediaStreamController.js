@@ -1656,8 +1656,9 @@ exports.handleMediaStream = async (twilioWs, req) => {
           // NOTE: marks are NOT enqueued here. Marks are now enqueued by the
           // Cartesia chunk handler (playback.recordChunk) so markQueue tracks
           // actual audio queued at Twilio, not text frames sent upstream.
-          const sentenceEnd = /[。！？!?]\s*$/.test(textBuffer) && textBuffer.length >= 10;
-          if (sentenceEnd || textBuffer.length >= 150) {
+          const sentenceEnd = /[。！？!?]\s*$/.test(textBuffer) && textBuffer.length >= 8;
+          const pausePoint = /[、,]\s*$/.test(textBuffer) && textBuffer.length >= 20;
+          if (sentenceEnd || pausePoint || textBuffer.length >= 60) {
             sendToCartesia(cartesiaWs, textBuffer, cartesiaContextId, true /* continue */, cartesiaVoiceId, cartesiaSpeed);
             textBuffer = '';
           }
