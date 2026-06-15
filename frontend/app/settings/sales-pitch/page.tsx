@@ -22,9 +22,11 @@ interface SalesPitchSettings {
   serviceDescription: string;
   targetPerson: string;
 
-  // AI設定
+   // AI設定
   voice: 'alloy' | 'cedar' | 'coral';
   speechRate: 'slow' | 'normal' | 'fast';
+  cartesiaVoiceId: string;
+  cartesiaVoiceGender: 'female' | 'male';
 }
 
 export default function SalesPitchSettingsPage() {
@@ -39,7 +41,9 @@ export default function SalesPitchSettingsPage() {
 
     // AI設定
     voice: 'alloy',
-    speechRate: 'normal'
+    speechRate: 'normal',
+    cartesiaVoiceId: 'fd1ee8f5-223a-4a87-a2fe-37eb3706cd69',
+    cartesiaVoiceGender: 'female'
   });
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -78,7 +82,9 @@ export default function SalesPitchSettingsPage() {
 
           // AI設定
           voice: validatedVoice,
-          speechRate: agentData.conversationSettings?.speechRate || 'normal'
+          speechRate: agentData.conversationSettings?.speechRate || 'normal',
+          cartesiaVoiceId: agentData.cartesiaVoiceId || 'fd1ee8f5-223a-4a87-a2fe-37eb3706cd69',
+          cartesiaVoiceGender: agentData.cartesiaVoiceGender || 'female'
         });
       } else {
         console.log('Agent settings not found, using defaults');
@@ -123,6 +129,8 @@ export default function SalesPitchSettingsPage() {
         },
         body: JSON.stringify({
           voice: settings.voice,
+          cartesiaVoiceId: settings.cartesiaVoiceId,
+          cartesiaVoiceGender: settings.cartesiaVoiceGender,
           conversationSettings: {
             companyName: settings.companyName,
             serviceName: settings.serviceName,
@@ -379,6 +387,44 @@ export default function SalesPitchSettingsPage() {
             <CardContent>
               <div className="space-y-6">
                 {/* AIボイス */}
+                {/* Cartesia音声性別選択 */}
+                <div className="space-y-3">
+                  <Label>AI音声（性別）</Label>
+                  <p className="text-sm text-muted-foreground">通話で使用するAIの声の性別を選択します</p>
+                  <div className="flex gap-4">
+                    <div
+                      className={`flex-1 border-2 rounded-lg p-4 cursor-pointer transition-colors ${
+                        settings.cartesiaVoiceGender === 'female'
+                          ? 'border-blue-500 bg-blue-50'
+                          : 'border-gray-200 hover:border-gray-300'
+                      }`}
+                      onClick={() => setSettings(prev => ({
+                        ...prev,
+                        cartesiaVoiceGender: 'female',
+                        cartesiaVoiceId: 'fd1ee8f5-223a-4a87-a2fe-37eb3706cd69'
+                      }))}
+                    >
+                      <div className="font-medium">👩 女性の声</div>
+                      <div className="text-sm text-muted-foreground">現在のデフォルト音声</div>
+                    </div>
+                    <div
+                      className={`flex-1 border-2 rounded-lg p-4 cursor-pointer transition-colors ${
+                        settings.cartesiaVoiceGender === 'male'
+                          ? 'border-blue-500 bg-blue-50'
+                          : 'border-gray-200 hover:border-gray-300'
+                      }`}
+                      onClick={() => setSettings(prev => ({
+                        ...prev,
+                        cartesiaVoiceGender: 'male',
+                        cartesiaVoiceId: '177df681-25b1-48c2-bb47-03ca5fa27f0a'
+                      }))}
+                    >
+                      <div className="font-medium">👨 男性の声</div>
+                      <div className="text-sm text-muted-foreground">男性AI音声</div>
+                    </div>
+                  </div>
+                </div>
+
                 <div className="space-y-3">
                   <Label>AIボイス</Label>
                   <RadioGroup
