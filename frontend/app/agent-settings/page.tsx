@@ -38,6 +38,8 @@ export default function AgentSettingsPage() {
     settings: {
       phoneNumber: '',
       isAvailable: true,
+      cartesiaVoiceId: '',
+      cartesiaVoiceGender: 'female',
       conversationSettings: {
         companyName: '',
         serviceName: '',
@@ -112,6 +114,11 @@ export default function AgentSettingsPage() {
     setSaving(true);
     try {
       await agentAPI.updatePhone(profile.settings.phoneNumber);
+      await agentAPI.updateConversation({
+        ...profile.settings.conversationSettings,
+        cartesiaVoiceId: profile.settings.cartesiaVoiceId,
+        cartesiaVoiceGender: profile.settings.cartesiaVoiceGender
+      });
       toast.success('電話番号を更新しました');
     } catch (error) {
       toast.error('電話番号の更新に失敗しました');
@@ -310,6 +317,53 @@ export default function AgentSettingsPage() {
                 <p className="text-sm text-muted-foreground mt-2">
                   通話が引き継がれる際、この番号に着信します
                 </p>
+              </div>
+
+              <Separator />
+
+              <div>
+                <Label>AI音声の性別</Label>
+                <p className="text-sm text-muted-foreground mb-3">
+                  通話で使用するAIの声を選択します
+                </p>
+                <div className="flex gap-4">
+                  <div
+                    className={`flex-1 border-2 rounded-lg p-4 cursor-pointer transition-colors ${
+                      profile.settings.cartesiaVoiceGender === 'female'
+                        ? 'border-blue-500 bg-blue-50'
+                        : 'border-gray-200'
+                    }`}
+                    onClick={() => setProfile(prev => ({
+                      ...prev,
+                      settings: {
+                        ...prev.settings,
+                        cartesiaVoiceGender: 'female',
+                        cartesiaVoiceId: 'fd1ee8f5-223a-4a87-a2fe-37eb3706cd69'
+                      }
+                    }))}
+                  >
+                    <div className="font-medium">女性の声</div>
+                    <div className="text-sm text-muted-foreground">現在のデフォルト音声</div>
+                  </div>
+                  <div
+                    className={`flex-1 border-2 rounded-lg p-4 cursor-pointer transition-colors ${
+                      profile.settings.cartesiaVoiceGender === 'male'
+                        ? 'border-blue-500 bg-blue-50'
+                        : 'border-gray-200'
+                    }`}
+                    onClick={() => setProfile(prev => ({
+                      ...prev,
+                      settings: {
+                        ...prev.settings,
+                        cartesiaVoiceGender: 'male',
+                        cartesiaVoiceId: '177df681-25b1-48c2-bb47-03ca5fa27f0a'
+                      }
+                    }))}
+                  >
+                    <div className="font-medium">男性の声</div>
+                    <div className="text-sm text-muted-foreground">男性AI音声</div>
+                  </div>
+                </div>
               </div>
 
               <Button onClick={handleSavePhoneSettings} disabled={saving}>
