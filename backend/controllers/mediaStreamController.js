@@ -14,27 +14,18 @@ const CARTESIA_VOICE_ID_DEFAULT = process.env.CARTESIA_VOICE_ID || 'fd1ee8f5-223
 const CARTESIA_MODEL_ID = process.env.CARTESIA_MODEL_ID || 'sonic-3';
 const CARTESIA_API_VERSION = process.env.CARTESIA_API_VERSION || '2026-03-01';
 
-// Audio drain tuning — how long to wait after marks ack before hangup, and a hard fallback.
 const CARTESIA_TAIL_MS = parseInt(process.env.CARTESIA_TAIL_MS || '700', 10);
 const CARTESIA_DRAIN_TIMEOUT_MS = parseInt(process.env.CARTESIA_DRAIN_TIMEOUT_MS || '15000', 10);
 
-// Bounded fallback: if the handoff announcement (response B) never produces a
-// cartesia context (model emits no announcement), execute the handoff directly
-// after this window so a dead stream cannot stay open forever.
 const HANDOFF_ANNOUNCE_FALLBACK_MS = parseInt(process.env.HANDOFF_ANNOUNCE_FALLBACK_MS || '8000', 10);
 
-// 同一通話に対する自動ハンドオフの二重実行防止（idempotency backstop）。
-// 稀なタイミング（announcement の output_text.done と response.done の間の
-// barge-in 等）で executeAutoHandoff が二度呼ばれても、二重に会議へ発信しない。
 const inflightAutoHandoffs = new Set();
 
-// Deterministic closing phrases used when AI is finished and we control the hangup.
-// (Avoids relying on AI to actually produce a goodbye — model may stop early.)
 const CLOSING_PHRASES = {
   rejection: '承知いたしました。お忙しいところ恐れ入ります。それでは失礼いたします。',
   absent: '承知いたしました。また改めてご連絡いたします。お忙しいところ恐れ入ります。それでは失礼いたします。',
   no_response: '承知いたしました。また改めてご連絡いたします。お忙しいところ恐れ入ります。それでは失礼いたします。',
-  voicemail: null, // 留守番電話には何もしゃべらない（即時 hangup）
+  voicemail: null,
   handoff_fallback: '申し訳ございません。担当者が応答できませんでした。改めてご連絡いたします。それでは失礼いたします。'
 };
 exports.CLOSING_PHRASES = CLOSING_PHRASES;
@@ -45,20 +36,6 @@ function nextClosingCtxId(tag) {
   return `closing-${tag}-${Date.now()}-${closingCounter}`;
 }
 
-/**
- * Drive a deterministic call-end:
- *   1. Acknowledge the OpenAI function call (success, no response.create).
- *   2. Open a fresh Cartesia context, push the deterministic closing phrase
- *      (if any), and finalize that context.
- *   3. Schedule the actual hangup (executor) to run only after Cartesia chunks
- *      for that context land at Twilio AND Twilio acks the marks AND tail.
- *
- * Skipping response.create is intentional — it stops the model from improvising
- * extra turns after we've decided to close, which previously caused mid-syllable
- * hangups.
- *
- * Required collaborators are injected so this function is unit-testable.
- */
 function handleDeterministicCallEnd({ endType, phrase, item, openaiWs, cartesiaWs, playback, executor }) {
   let args = {};
   try {
@@ -67,17 +44,6 @@ function handleDeterministicCallEnd({ endType, phrase, item, openaiWs, cartesiaW
     console.error('[FunctionCall] Error parsing arguments:', e.message);
   }
 
-  // 1. Ack the function call so OpenAI's tool-call state is clean.
-  //
-  // We DELIBERATELY do NOT send `response.create` afterwards:
-  //   - We are about to terminate the call, so we don't need the model to
-  //     produce another turn.
-  //   - In production we saw the model occasionally improvise extra text
-  //     after a closing function-call, which then cut off mid-syllable when
-  //     we hung up. Skipping response.create removes that variance.
-  //   - OpenAI Realtime accepts function_call_output without a paired
-  //     response.create — the conversation state just stays at "tool result
-  //     received". That's fine for a session we're about to close.
   if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
     try {
       openaiWs.send(JSON.stringify({
@@ -91,17 +57,11 @@ function handleDeterministicCallEnd({ endType, phrase, item, openaiWs, cartesiaW
           })
         }
       }));
-      // NOTE: intentionally NOT sending `response.create`.
     } catch (e) {
       console.error('[FunctionCall] function_call_output send error:', e.message);
     }
   }
 
-  // Voicemail / silent close fast path: no phrase to speak, and no Cartesia
-  // round-trip — just invalidate any AI audio in flight, wait a short tail
-  // for whatever Twilio already has buffered, then hangup. This avoids the
-  // 15s drainTimeout we'd otherwise hit on an empty Cartesia context that
-  // never emits `done`.
   if (!phrase) {
     console.log('[AutoCallEnd] ' + endType + ' silent close — no phrase');
     playback.invalidateAll(endType + '_silent');
@@ -117,7 +77,6 @@ function handleDeterministicCallEnd({ endType, phrase, item, openaiWs, cartesiaW
   playback.startContext(ctxId);
 
   sendToCartesia(cartesiaWs, phrase, ctxId, true);
-  // Always finalize so Cartesia emits `done` and the tracker can drain.
   sendToCartesia(cartesiaWs, '', ctxId, false);
 
   playback.scheduleHangupOnDrain(ctxId, () => {
@@ -129,11 +88,6 @@ function handleDeterministicCallEnd({ endType, phrase, item, openaiWs, cartesiaW
   return ctxId;
 }
 
-/**
- * Run handoff; if it fails (no answer, busy, generic error) speak the fallback
- * closing phrase and only then hangup. handoffData carries the OpenAI call_id,
- * parsed args, and the cartesia ctxId of the announcement.
- */
 async function executeHandoffWithFallback(callSession, handoffData, twilioWs, getStreamSid, cartesiaWs, playback) {
   let result;
   try {
@@ -145,7 +99,6 @@ async function executeHandoffWithFallback(callSession, handoffData, twilioWs, ge
 
   if (result && result.success) return result;
 
-  // Handoff failed — play deterministic fallback phrase and hangup cleanly.
   console.warn('[AutoHandoff] failed — playing fallback closing phrase');
   const ctxId = nextClosingCtxId('handoff-fallback');
   playback.startContext(ctxId);
@@ -155,7 +108,6 @@ async function executeHandoffWithFallback(callSession, handoffData, twilioWs, ge
   sendToCartesia(cartesiaWs, '', ctxId, false);
   playback.scheduleHangupOnDrain(ctxId, () => {
     console.log('[AutoHandoff] fallback closing drained — hanging up');
-    // Reuse the rejection executor (it sets callResult appropriately and ends the call).
     executeAutoCallEnd(callSession, handoffData.callId, {
       rejection_reason: '担当者転送失敗のため終話',
     }).catch(err => console.error('[AutoHandoff fallback] executor error:', err));
@@ -165,7 +117,6 @@ async function executeHandoffWithFallback(callSession, handoffData, twilioWs, ge
 exports.handleDeterministicCallEnd = handleDeterministicCallEnd;
 exports.executeHandoffWithFallback = executeHandoffWithFallback;
 
-// Event types to log (from official sample line 25-30)
 const LOG_EVENT_TYPES = [
   'error',
   'response.content.done',
@@ -184,12 +135,6 @@ const LOG_EVENT_TYPES = [
   'response.output_text.done'
 ];
 
-/**
- * Execute automatic call termination when customer rejects the offer
- * @param {Object} callSession - CallSession document
- * @param {String} functionCallId - OpenAI function call ID
- * @param {Object} args - Function arguments (rejection_reason)
- */
 async function executeAutoCallEnd(callSession, functionCallId, args) {
   try {
     console.log('[AutoCallEnd] 顧客拒否による自動切電を実行');
@@ -197,29 +142,24 @@ async function executeAutoCallEnd(callSession, functionCallId, args) {
     console.log('[AutoCallEnd] Function Call ID:', functionCallId);
     console.log('[AutoCallEnd] 拒否理由:', args.rejection_reason);
 
-    // 拒否理由から「不在」キーワードを検出してステータスを自動修正
-    // Promptで制御しきれない場合（AIがend_call_on_rejectionを選んでしまった場合）の安全策
     let finalCallResult = '拒否';
     let finalNotes = args.rejection_reason ? `AI判断による切電: ${args.rejection_reason}` : 'AI判断による切電';
 
-    // 不在判定キーワード
     const absentKeywords = [
       '不在', '外出', '外出中',
       '席を外して', '席を外しております', '席を外してい',
       '会議中', '会議に', '会議で',
       '休み', '本日休', 'お休み', 'お休みを',
-      '戻り', 'ただいま外', 
+      '戻り', 'ただいま外',
       '退職', '離席',
       'いません', 'おりません', 'ございません',
       'でかけています', 'でかけております',
       '手が離せ', '対応できません', '出張'
     ];
 
-    // Step 1: AIの引数をチェック（従来ロジック）
     const reasonText = args.rejection_reason || '';
     let absentDetected = absentKeywords.some(keyword => reasonText.includes(keyword));
 
-    // Step 2: 引数で検出できなかった場合、全会話履歴をスキャン（新ロジック）
     if (!absentDetected && callSession.transcript && Array.isArray(callSession.transcript)) {
       const allCustomerMessages = callSession.transcript
         .filter(t => t.speaker === 'customer')
@@ -233,31 +173,27 @@ async function executeAutoCallEnd(callSession, functionCallId, args) {
       }
     }
 
-    // 不在が検出された場合、ステータスを上書き
     if (absentDetected) {
       console.log('[AutoCallEnd] ⚠️ 不在キーワード検出 - ステータスを「不在」に変更します');
       finalCallResult = '不在';
       finalNotes = 'AI判断による切電';
     }
 
-    // CallSessionの更新
     callSession.status = 'completed';
     callSession.endTime = new Date();
-    callSession.callResult = finalCallResult;  // 修正後の結果
+    callSession.callResult = finalCallResult;
     callSession.endReason = 'ai_initiated';
     callSession.notes = finalNotes;
 
     await callSession.save();
     console.log('[AutoCallEnd] CallSession更新完了');
 
-    // Twilio通話終了
     if (callSession.twilioCallSid && callSession.twilioCallSid !== 'pending') {
       const twilioService = require('../services/twilioService');
       await twilioService.endCall(callSession.twilioCallSid);
       console.log('[AutoCallEnd] Twilio通話終了完了:', callSession.twilioCallSid);
     }
 
-    // WebSocket通知（ユーザー専用ルームに送信）
     if (global.io && callSession.userId) {
       const eventData = {
         customerId: callSession.customerId?.toString() || callSession.customerId,
@@ -271,35 +207,20 @@ async function executeAutoCallEnd(callSession, functionCallId, args) {
       console.log(`[WebSocket] Emitted callStatusUpdate to user ${callSession.userId}: completed (拒否)`, JSON.stringify(eventData));
     }
 
-    return {
-      success: true,
-      message: '通話を終了しました'
-    };
+    return { success: true, message: '通話を終了しました' };
 
   } catch (error) {
     console.error('[AutoCallEnd] エラー:', error);
-    return {
-      success: false,
-      message: '切電処理に失敗しました',
-      error: error.message
-    };
+    return { success: false, message: '切電処理に失敗しました', error: error.message };
   }
 }
 
-/**
- * Execute automatic call termination when customer stops responding
- * @param {Object} callSession - CallSession document
- * @param {String} functionCallId - OpenAI function call ID
- * @param {Object} args - Function arguments
- * @param {String} type - Call end type ('no_response' or 'voicemail')
- */
 async function executeAutoCallEndOnNoResponse(callSession, functionCallId, args, type = 'no_response') {
   try {
     console.log('[AutoCallEnd-NoResponse] 顧客無応答による自動切電を実行');
     console.log('[AutoCallEnd-NoResponse] CallSession ID:', callSession._id);
     console.log('[AutoCallEnd-NoResponse] Function Call ID:', functionCallId);
 
-    // CallSessionの更新
     callSession.status = 'completed';
     callSession.endTime = new Date();
     callSession.callResult = '不在';
@@ -311,14 +232,12 @@ async function executeAutoCallEndOnNoResponse(callSession, functionCallId, args,
     await callSession.save();
     console.log('[AutoCallEnd-NoResponse] CallSession更新完了');
 
-    // Twilio通話終了
     if (callSession.twilioCallSid && callSession.twilioCallSid !== 'pending') {
       const twilioService = require('../services/twilioService');
       await twilioService.endCall(callSession.twilioCallSid);
       console.log('[AutoCallEnd-NoResponse] Twilio通話終了完了:', callSession.twilioCallSid);
     }
 
-    // WebSocket通知（ユーザー専用ルームに送信）
     if (global.io && callSession.userId) {
       const eventData = {
         customerId: callSession.customerId?.toString() || callSession.customerId,
@@ -332,27 +251,14 @@ async function executeAutoCallEndOnNoResponse(callSession, functionCallId, args,
       console.log(`[WebSocket] Emitted callStatusUpdate to user ${callSession.userId}: completed (不在)`, JSON.stringify(eventData));
     }
 
-    return {
-      success: true,
-      message: '通話を終了しました'
-    };
+    return { success: true, message: '通話を終了しました' };
 
   } catch (error) {
     console.error('[AutoCallEnd-NoResponse] エラー:', error);
-    return {
-      success: false,
-      message: '切電処理に失敗しました',
-      error: error.message
-    };
+    return { success: false, message: '切電処理に失敗しました', error: error.message };
   }
 }
 
-/**
- * Execute automatic call termination when target person is absent
- * @param {Object} callSession - CallSession document
- * @param {String} functionCallId - OpenAI function call ID
- * @param {Object} args - Function arguments (absent_reason)
- */
 async function executeAutoCallEndOnAbsent(callSession, functionCallId, args) {
   try {
     console.log('[AutoCallEnd-Absent] 担当者不在による自動切電を実行');
@@ -360,7 +266,6 @@ async function executeAutoCallEndOnAbsent(callSession, functionCallId, args) {
     console.log('[AutoCallEnd-Absent] Function Call ID:', functionCallId);
     console.log('[AutoCallEnd-Absent] 不在理由:', args.absent_reason);
 
-    // CallSessionの更新
     callSession.status = 'completed';
     callSession.endTime = new Date();
     callSession.callResult = '不在';
@@ -370,14 +275,12 @@ async function executeAutoCallEndOnAbsent(callSession, functionCallId, args) {
     await callSession.save();
     console.log('[AutoCallEnd-Absent] CallSession更新完了');
 
-    // Twilio通話終了
     if (callSession.twilioCallSid && callSession.twilioCallSid !== 'pending') {
       const twilioService = require('../services/twilioService');
       await twilioService.endCall(callSession.twilioCallSid);
       console.log('[AutoCallEnd-Absent] Twilio通話終了完了:', callSession.twilioCallSid);
     }
 
-    // WebSocket通知（ユーザー専用ルームに送信）
     if (global.io && callSession.userId) {
       const eventData = {
         customerId: callSession.customerId?.toString() || callSession.customerId,
@@ -391,38 +294,19 @@ async function executeAutoCallEndOnAbsent(callSession, functionCallId, args) {
       console.log(`[WebSocket] Emitted callStatusUpdate to user ${callSession.userId}: completed (不在)`, JSON.stringify(eventData));
     }
 
-    return {
-      success: true,
-      message: '通話を終了しました'
-    };
+    return { success: true, message: '通話を終了しました' };
 
   } catch (error) {
     console.error('[AutoCallEnd-Absent] エラー:', error);
-    return {
-      success: false,
-      message: '切電処理に失敗しました',
-      error: error.message
-    };
+    return { success: false, message: '切電処理に失敗しました', error: error.message };
   }
 }
 
-/**
- * Execute automatic handoff when AI determines transfer is appropriate
- * @param {Object} callSession - CallSession document
- * @param {String} functionCallId - OpenAI function call ID
- * @param {Object} args - Function arguments (customer_consent, reason)
- */
 async function executeAutoHandoff(callSession, functionCallId, args) {
-  // 二重実行ガード：同一通話で既にハンドオフ実行中なら no-op で抜ける。
-  // （ctx 束縛ハングアップと response.done 経路が稀に競合しても会議への二重発信を防ぐ）
   const handoffKey = String(callSession._id);
   if (inflightAutoHandoffs.has(handoffKey)) {
     console.log('[AutoHandoff] Handoff already in progress for this call — skipping duplicate');
-    return {
-      success: true,
-      message: '転送は既に進行中です',
-      alreadyInProgress: true
-    };
+    return { success: true, message: '転送は既に進行中です', alreadyInProgress: true };
   }
   inflightAutoHandoffs.add(handoffKey);
   try {
@@ -431,13 +315,11 @@ async function executeAutoHandoff(callSession, functionCallId, args) {
     console.log('[AutoHandoff] Function Call ID:', functionCallId);
     console.log('[AutoHandoff] Arguments:', args);
 
-    // 顧客の同意確認
     if (args.customer_consent !== true) {
       console.log('[AutoHandoff] Customer did not consent, skipping handoff');
       return;
     }
 
-    // CallSessionからユーザー情報を取得
     const userId = callSession.assignedAgent;
     if (!userId) {
       console.error('[AutoHandoff] No assigned agent for this call session');
@@ -460,20 +342,17 @@ async function executeAutoHandoff(callSession, functionCallId, args) {
     console.log('[AutoHandoff] User found:', user.email);
     console.log('[AutoHandoff] Handoff phone:', user.handoffPhoneNumber);
 
-    // 既存のhandoffControllerロジックを利用
     const handoffController = require('./handoffController');
 
-    // ハンドオフ実行
     const result = await handoffController.executeHandoffLogic(
       callSession,
       user,
-      'ai-auto',  // ハンドオフ方法
-      args.reason || '顧客の承諾'  // 転送理由
+      'ai-auto',
+      args.reason || '顧客の承諾'
     );
 
     console.log('[AutoHandoff] Handoff executed successfully:', result);
 
-    // Function call の結果をOpenAIに返す（成功）
     return {
       success: true,
       message: '担当者への転送を開始しました',
@@ -482,8 +361,6 @@ async function executeAutoHandoff(callSession, functionCallId, args) {
 
   } catch (error) {
     console.error('[AutoHandoff] Error executing handoff:', error);
-
-    // Function call の結果をOpenAIに返す（失敗）
     return {
       success: false,
       message: '転送に失敗しました。申し訳ございません。',
@@ -494,14 +371,8 @@ async function executeAutoHandoff(callSession, functionCallId, args) {
   }
 }
 
-/**
- * Extract text from OpenAI Realtime API content array
- * Content can include: output_audio (with transcript), output_text, text, input_text, input_audio, etc.
- */
 function extractTextFromContent(content) {
-  if (!content || !Array.isArray(content)) {
-    return '';
-  }
+  if (!content || !Array.isArray(content)) return '';
 
   const textParts = content
     .filter(item => {
@@ -511,64 +382,48 @@ function extractTextFromContent(content) {
         item.type === 'output_audio' ||
         item.type === 'audio';
     })
-    .map(item => {
-      return item.transcript || item.text || '';
-    })
+    .map(item => item.transcript || item.text || '')
     .filter(text => text.length > 0);
 
   return textParts.join(' ').trim();
 }
 
-/**
- * Send conversation update via WebSocket (memory storage only)
- */
 function sendConversationUpdate(callSession, role, text, timestamp = new Date()) {
   if (!text || !global.io) return;
 
   const speaker = role === 'assistant' ? 'ai' : role === 'user' ? 'customer' : 'system';
   const phoneNumber = callSession.phoneNumber;
-  // トランスクリプトをメモリに保存（通話終了時にDBに一括保存）
   if (!callSession.transcript) {
     callSession.transcript = [];
   }
-  callSession.transcript.push({
-    speaker: speaker,
-    message: text,
-    timestamp: timestamp
-  });
+  callSession.transcript.push({ speaker, message: text, timestamp });
   console.log('[Conversation] Stored in memory:', {
     callId: callSession._id.toString(),
-    speaker: speaker,
+    speaker,
     transcriptLength: callSession.transcript.length
   });
 
-  // WebSocketでリアルタイム送信（ユーザー専用ルームに送信）
   if (global.io && callSession.userId) {
     global.io.to(`user-${callSession.userId}`).emit('transcript-update', {
       callId: callSession._id.toString(),
       callSid: callSession.twilioCallSid,
-      phoneNumber: phoneNumber,
-      speaker: speaker,
-      text: text,
+      phoneNumber,
+      speaker,
+      text,
       message: text,
-      timestamp: timestamp
+      timestamp
     });
     console.log(`[WebSocket] Emitted transcript-update to user ${callSession.userId}`);
   }
 
   console.log('[Conversation] Sent WebSocket update:', {
     callId: callSession._id.toString(),
-    speaker: speaker,
+    speaker,
     textLength: text.length
   });
 }
 
-/**
- * Initialize OpenAI Realtime API session
- * Reference: official sample line 209-231
- */
 async function initializeSession(openaiWs, agentSettings) {
-  // Build instructions using the new prompt builder (受付突破特化型)
   let instructions;
   try {
     instructions = buildOpenAIInstructions(agentSettings);
@@ -579,14 +434,11 @@ async function initializeSession(openaiWs, agentSettings) {
     console.log('[OpenAI] サービス名チェック:', instructions.includes(agentSettings.conversationSettings.serviceName) ? '✅含まれる' : '❌含まれない');
   } catch (error) {
     console.error('[OpenAI] ❌ instructions生成失敗:', error);
-    // Fallback to simple instructions
     instructions = "You are a helpful AI assistant for making business calls.";
   }
 
   const temperature = agentSettings?.temperature || 0.8;
 
-  // OpenAI Realtime API GA format (session.type = "realtime", output_modalities, nested audio)
-  // Only audio.input is set since output goes to Cartesia TTS instead of OpenAI audio.
   const sessionUpdate = {
     type: "session.update",
     session: {
@@ -595,21 +447,19 @@ async function initializeSession(openaiWs, agentSettings) {
       output_modalities: ["text"],
       audio: {
         input: {
-            format: { type: "audio/pcmu" },
-            noise_reduction: {
-              type: "near_field"
-            },
-            turn_detection: {
-              type: "server_vad",
-              threshold: 0.4,
-              prefix_padding_ms: 200,
-              silence_duration_ms: 400
-            },
-            transcription: {
-              model: "gpt-4o-transcribe",
-              language: "ja"
-            }
+          format: { type: "audio/pcmu" },
+          noise_reduction: { type: "near_field" },
+          turn_detection: {
+            type: "server_vad",
+            threshold: 0.4,
+            prefix_padding_ms: 200,
+            silence_duration_ms: 400
+          },
+          transcription: {
+            model: "gpt-4o-transcribe",
+            language: "ja"
           }
+        }
       },
       instructions: instructions,
       tools: [
@@ -696,7 +546,7 @@ async function initializeSession(openaiWs, agentSettings) {
           }
         }
       ],
-      tool_choice: "auto"  // AIが自動的に判断して関数を呼び出す
+      tool_choice: "auto"
     }
   };
 
@@ -705,13 +555,6 @@ async function initializeSession(openaiWs, agentSettings) {
   openaiWs.send(JSON.stringify(sessionUpdate));
 }
 
-/**
- * Send a single mark event to Twilio. Mark name must encode the cartesia context_id
- * and a per-chunk sequence so that the receiver can ack it back to a specific context.
- *
- * Format: cartesia:<ctxId>:<seq>
- * markQueue records the same string so we know how many marks are in-flight.
- */
 function sendChunkMark(twilioWs, streamSid, markName, markQueue = null) {
   if (!streamSid) {
     console.warn('[Mark] Skipped: streamSid is null');
@@ -735,10 +578,6 @@ function sendChunkMark(twilioWs, streamSid, markName, markQueue = null) {
   }
 }
 
-/**
- * Parse a chunk-mark name back into { ctxId, seq }.
- * Returns null for any other mark format (legacy / unrelated).
- */
 function parseChunkMark(name) {
   if (typeof name !== 'string' || !name.startsWith('cartesia:')) return null;
   const parts = name.split(':');
@@ -752,15 +591,6 @@ function createCartesiaContextId(responseId, itemId) {
   return `ctx-${responseId}-${itemId}`;
 }
 
-/**
- * Create a Cartesia TTS WebSocket and emit per-chunk callbacks so the caller can
- * decide whether to forward audio (and enqueue a mark) or drop it as stale.
- *
- * Callbacks:
- *   onChunk({ ctxId, payload }) — Cartesia gave us an audio chunk for ctxId
- *   onContextDone({ ctxId })   — Cartesia finalized generation for ctxId
- *   onError(msg)               — Cartesia signaled an error
- */
 function createCartesiaWs(twilioWs, getStreamSid, callbacks = {}) {
   if (!process.env.CARTESIA_API_KEY) {
     console.error('[Cartesia] CARTESIA_API_KEY is not set');
@@ -782,7 +612,6 @@ function createCartesiaWs(twilioWs, getStreamSid, callbacks = {}) {
         if (callbacks.onChunk) {
           callbacks.onChunk({ ctxId: msg.context_id, payload: msg.data });
         } else {
-          // Backward-compatible fallback: blindly forward to Twilio (no mark).
           const sid = getStreamSid();
           if (twilioWs && twilioWs.readyState === WebSocket.OPEN && sid) {
             twilioWs.send(JSON.stringify({
@@ -808,28 +637,10 @@ function createCartesiaWs(twilioWs, getStreamSid, callbacks = {}) {
   return ws;
 }
 
-// Export low-level helpers so tests can drive the playback-sync logic directly.
 exports.parseChunkMark = parseChunkMark;
 exports.sendChunkMark = sendChunkMark;
 exports.createCartesiaContextId = createCartesiaContextId;
 
-/**
- * Centralized per-context audio-drain tracker.
- *
- * For every Cartesia context we know:
- *   marks            number of marks sent to Twilio that haven't been ack'd yet
- *   doneFromCartesia Cartesia signaled end of generation for this context
- *   invalidated      we asked Cartesia to drop this context (barge-in, etc.)
- *   pendingHangup    a callback to fire after this context drains (+ tail)
- *
- * "Drained" = doneFromCartesia AND marks === 0. When drained, any pending
- * hangup is scheduled with CARTESIA_TAIL_MS extra grace before firing.
- *
- * Why this matters:
- *   OpenAI response.done fires BEFORE Cartesia finishes synthesizing audio.
- *   Twilio mark acks confirm audio is queued for playback. So we need both
- *   "Cartesia said done" AND "Twilio acked all marks" before we hangup.
- */
 function createPlaybackTracker({ tailMs = CARTESIA_TAIL_MS, drainTimeoutMs = CARTESIA_DRAIN_TIMEOUT_MS, logger = console } = {}) {
   const contexts = new Map();
   const markQueue = [];
@@ -871,22 +682,11 @@ function createPlaybackTracker({ tailMs = CARTESIA_TAIL_MS, drainTimeoutMs = CAR
     checkDrain(id);
   }
 
-  // Cheap inspector for callers that want to validate-before-send.
-  // Returns true if the context exists and is NOT invalidated.
   function canAcceptChunk(id) {
     const ctx = getContext(id);
     return !!(ctx && !ctx.invalidated);
   }
 
-  // Called by Cartesia chunk handler AFTER media has been successfully sent
-  // to Twilio. Allocates a new mark seq, bumps in-flight counters, and pushes
-  // the mark name onto markQueue.
-  //
-  // ORDER MATTERS: callers must send the audio media frame FIRST, then call
-  // recordChunk + sendChunkMark. If the media send fails, do NOT call
-  // recordChunk. If recordChunk succeeded but sendChunkMark failed, call
-  // rollbackChunk(markName) to release the slot — otherwise the in-flight
-  // counter never reaches 0 and the drain timeout (default 15s) fires later.
   function recordChunk(id) {
     const ctx = getContext(id);
     if (!ctx) {
@@ -905,18 +705,11 @@ function createPlaybackTracker({ tailMs = CARTESIA_TAIL_MS, drainTimeoutMs = CAR
     return markName;
   }
 
-  // Undo a recordChunk that the caller couldn't actually flush downstream
-  // (mark send failed, twilio ws closed mid-write, etc.).
-  //
-  // TRULY idempotent: counter is decremented ONLY when the mark was actually
-  // removed from markQueue. If the mark is unknown / already-rolled-back /
-  // already-ack'd, this is a no-op. (Codex round-2 minor #1 caught the bug
-  // where double-rollback used to under-count an unrelated in-flight mark.)
   function rollbackChunk(markName) {
     const parsed = parseChunkMark(markName);
     if (!parsed) return;
     const idx = markQueue.indexOf(markName);
-    if (idx < 0) return; // already removed (acked or rolled back) — no-op
+    if (idx < 0) return;
     markQueue.splice(idx, 1);
     const ctx = getContext(parsed.ctxId);
     if (!ctx) return;
@@ -925,15 +718,12 @@ function createPlaybackTracker({ tailMs = CARTESIA_TAIL_MS, drainTimeoutMs = CAR
     checkDrain(parsed.ctxId);
   }
 
-  // Called when Twilio acks a mark we sent.
   function ackMark(markName) {
     const parsed = parseChunkMark(markName);
     if (!parsed) {
-      // Legacy / unknown mark — just shift one entry off the queue for parity.
       if (markQueue.length > 0) markQueue.shift();
       return;
     }
-    // Remove this exact mark from the queue (preserves multi-context ordering).
     const idx = markQueue.indexOf(markName);
     if (idx >= 0) markQueue.splice(idx, 1);
 
@@ -951,7 +741,6 @@ function createPlaybackTracker({ tailMs = CARTESIA_TAIL_MS, drainTimeoutMs = CAR
         clearTimeout(ctx.drainTimeout);
         ctx.drainTimeout = null;
       }
-      // If this was the active conversational context, AI is no longer speaking.
       if (activeContextId === id) {
         aiResponseActive = false;
         activeContextId = null;
@@ -979,9 +768,6 @@ function createPlaybackTracker({ tailMs = CARTESIA_TAIL_MS, drainTimeoutMs = CAR
     }, tailMs);
   }
 
-  // Schedule a callback to run AFTER ctxId drains + tail.
-  // If the context is already drained, fires immediately (+ tail).
-  // If chunks never arrive, drainTimeoutMs ensures we don't hang forever.
   function scheduleHangupOnDrain(id, fn) {
     const ctx = getContext(id, { create: true });
     if (ctx.pendingHangup) {
@@ -993,7 +779,6 @@ function createPlaybackTracker({ tailMs = CARTESIA_TAIL_MS, drainTimeoutMs = CAR
       firePendingHangup(id);
       return;
     }
-    // Safety net — if drain never happens (Cartesia error, network), force fire.
     if (ctx.drainTimeout) clearTimeout(ctx.drainTimeout);
     ctx.drainTimeout = setTimeout(() => {
       logger.warn('[Playback] drain timeout — forcing pending hangup ctx=' + id);
@@ -1003,8 +788,6 @@ function createPlaybackTracker({ tailMs = CARTESIA_TAIL_MS, drainTimeoutMs = CAR
     }, drainTimeoutMs);
   }
 
-  // Cancel a callback previously scheduled for one context. Used when a
-  // handoff announcement re-binds from an early clarifier to a later item.
   function cancelScheduledHangup(id) {
     const ctx = getContext(id);
     if (!ctx) return false;
@@ -1027,19 +810,11 @@ function createPlaybackTracker({ tailMs = CARTESIA_TAIL_MS, drainTimeoutMs = CAR
     return hadScheduledHangup;
   }
 
-  // Mark all active (non-invalidated) contexts as stale and clear the markQueue.
-  // Returns the list of invalidated ctxIds for downstream cleanup.
   function invalidateAll(reason) {
     const ids = [];
-    // Contexts whose pendingHangup is bound to a deliberate terminating
-    // announcement (closing/handoff) must NOT be permanently stranded by a
-    // transient barge-in. We keep their pendingHangup and re-fire it exactly
-    // once after the loop. Ordinary contexts behave as before (full cancel =
-    // genuine barge-in). UNIFIED GUARD per 林.
     const terminatingToFire = [];
     for (const [id, ctx] of contexts) {
       if (!ctx.invalidated) {
-        // Always mark invalidated (stops NEW cartesia chunks).
         ctx.invalidated = true;
         ids.push(id);
         if (ctx.drainTimeout) {
@@ -1047,20 +822,14 @@ function createPlaybackTracker({ tailMs = CARTESIA_TAIL_MS, drainTimeoutMs = CAR
           ctx.drainTimeout = null;
         }
         if (ctx.terminating && ctx.pendingHangup) {
-          // The callback has not entered its tail countdown yet. Clear any
-          // stale timer, preserve the callback, and re-fire once after reset.
           if (ctx.pendingHangupTimer) {
             clearTimeout(ctx.pendingHangupTimer);
             ctx.pendingHangupTimer = null;
           }
-          // Keep pendingHangup; it will be re-fired after the resets below.
           terminatingToFire.push(id);
         } else if (ctx.terminating && ctx.pendingHangupTimer) {
-          // firePendingHangup already moved the callback into the tail timer.
-          // Leave that in-flight timer alone; pendingHangup is null, so clearing
-          // it here would permanently lose the terminating callback.
+          // leave in-flight timer alone
         } else {
-          // Discard the pending hangup — caller (barge-in) is interrupting on purpose.
           if (ctx.pendingHangupTimer) {
             clearTimeout(ctx.pendingHangupTimer);
             ctx.pendingHangupTimer = null;
@@ -1073,8 +842,6 @@ function createPlaybackTracker({ tailMs = CARTESIA_TAIL_MS, drainTimeoutMs = CAR
     aiResponseActive = false;
     activeContextId = null;
     logger.log(`[Playback] invalidated ${ids.length} ctx(s) reason=${reason}`);
-    // Re-fire hangups bound to terminating contexts exactly once (after tail).
-    // firePendingHangup nulls pendingHangup first => single fire.
     for (const id of terminatingToFire) {
       const ctx = getContext(id);
       if (ctx && ctx.pendingHangup) {
@@ -1085,7 +852,6 @@ function createPlaybackTracker({ tailMs = CARTESIA_TAIL_MS, drainTimeoutMs = CAR
   }
 
   return {
-    // state
     contexts,
     markQueue,
     getActiveContextId: () => activeContextId,
@@ -1095,7 +861,6 @@ function createPlaybackTracker({ tailMs = CARTESIA_TAIL_MS, drainTimeoutMs = CAR
       if (!c) return null;
       return { marks: c.marks, chunks: c.chunks, doneFromCartesia: c.doneFromCartesia, invalidated: c.invalidated };
     },
-    // ops
     startContext,
     endContext,
     canAcceptChunk,
@@ -1110,11 +875,6 @@ function createPlaybackTracker({ tailMs = CARTESIA_TAIL_MS, drainTimeoutMs = CAR
 
 exports.createPlaybackTracker = createPlaybackTracker;
 
-/**
- * Send text to Cartesia for TTS synthesis.
- * - Use same contextId across one AI response, with continue: true for partial chunks
- * - Send continue: false (with empty text OK) to finalize generation
- */
 function sendToCartesia(cartesiaWs, text, contextId, continueFlag = false, voiceId = null, speed = null) {
   if (continueFlag && (!text || !text.trim())) return;
 
@@ -1142,25 +902,16 @@ function sendToCartesia(cartesiaWs, text, contextId, continueFlag = false, voice
   }
 }
 
-/**
- * Handle WebSocket connection for Twilio Media Streams
- * Reference: official sample line 62-188
- *
- * @param {WebSocket} twilioWs - WebSocket connection from Twilio Media Streams
- * @param {Express.Request} req - Express request object containing callId in params
- */
 exports.handleMediaStream = async (twilioWs, req) => {
   const callId = req.params.callId;
   console.log('[MediaStream] Client connected, callId:', callId);
 
-  // Validate OpenAI API key (matching Python sample line 34-35)
   if (!process.env.OPENAI_REALTIME_API_KEY) {
     console.error('[MediaStream] Missing OpenAI API key');
     twilioWs.close();
     return;
   }
 
-  // Connection state variables (official sample line 76-81)
   let streamSid = null;
   let latestMediaTimestamp = 0;
   let lastAssistantItem = null;
@@ -1169,40 +920,28 @@ exports.handleMediaStream = async (twilioWs, req) => {
   let cartesiaWs = null;
   let textBuffer = '';
   let currentResponseId = null;
-  let cartesiaContextId = null;       // assistant item ごとに分離する Cartesia context
-  let textDeltaEventType = null;      // 'response.text.delta' or 'response.output_text.delta'（最初に来た方を採用）
+  let cartesiaContextId = null;
+  let textDeltaEventType = null;
 
-  // Playback tracker — owns markQueue, per-context state, drain scheduling.
   const playback = createPlaybackTracker();
   const markQueue = playback.markQueue;
 
-  // Auto handoff / auto call end pending state (decoupled from markQueue —
-  // we attach the action to a specific cartesia context and fire it when
-  // THAT context drains).
   let pendingHandoff = null;
-  // True while we are waiting for the handoff announcement (response B) to start
-  // its own cartesia context so we can bind the hangup to THAT context.
   let handoffAwaitingAnnouncementCtx = false;
-  // Bounded fallback timer (armed at function_call time) so an empty/never-
-  // produced response B cannot leave the stream open forever.
   let handoffFallbackTimer = null;
-  // The announcement context currently owning drain-based handoff completion.
-  // Re-binding cancels the prior context before scheduling the new one.
   let scheduledHandoffCtxId = null;
   let handoffCompleted = false;
   let pendingCallEnd = null;
-  // Remember the last finalized context so response.done can close the
-  // announcement re-bind window without scheduling completion again.
   let lastCompletedCtxId = null;
 
-  // Customer silence detection state
   let customerSilenceTimer = null;
-  let customerSilenceCheckCount = 0;  // 0, 1, or 2 (for first, second check)
+  let customerSilenceCheckCount = 0;
 
-   // CallSession reference (will be loaded later)
   let callSession = null;
-  // 顧客発話開始時刻（STT完了時刻との差を補正するため）
   let speechStartedAt = null;
+
+  // ── フィラー制御用：直前に顧客が話したかどうかのフラグ ──
+  let customerJustSpoke = false;
 
   function completeHandoff(reason) {
     if (handoffCompleted) return;
@@ -1225,30 +964,21 @@ exports.handleMediaStream = async (twilioWs, req) => {
       .catch(err => console.error('[AutoHandoff] Error execution:', err));
   }
 
-  // ========================================
-  // Register Twilio WebSocket handlers IMMEDIATELY
-  // This ensures we don't miss 'connected' and 'start' events
-  // ========================================
-
-  // Receive messages from Twilio → Send to OpenAI
-  // Reference: official sample line 83-108
   twilioWs.on('message', (message) => {
     try {
       const data = JSON.parse(message);
       console.log('[Twilio→Backend] Received message:', JSON.stringify(data).substring(0, 200), 'callId:', callId);
       console.log('[Twilio→Backend] Event type:', data.event || 'NO EVENT FIELD');
 
-      // Handle media event (official sample line 89-95)
       if (data.event === 'media' && openaiWs && openaiWs.readyState === WebSocket.OPEN) {
         latestMediaTimestamp = parseInt(data.media.timestamp);
         const audioAppend = {
           type: "input_audio_buffer.append",
-          audio: data.media.payload  // ← Already base64-encoded μ-law, send as-is
+          audio: data.media.payload
         };
         openaiWs.send(JSON.stringify(audioAppend));
       }
 
-      // Handle stream start (official sample line 96-101)
       else if (data.event === 'start') {
         streamSid = data.start.streamSid;
         console.log('[MediaStream] Stream started:', streamSid);
@@ -1256,20 +986,13 @@ exports.handleMediaStream = async (twilioWs, req) => {
         latestMediaTimestamp = 0;
         lastAssistantItem = null;
 
-        // Update streamSid in global map
         const connection = global.activeMediaStreams.get(callId);
         if (connection) {
           connection.streamSid = streamSid;
           console.log('[MediaStream] Updated streamSid in global map:', callId);
         }
-
-        // Note: callStatusUpdate 'calling' is now sent in openaiWs.on('open') handler
-        // to avoid race condition where this 'start' event arrives before callSession is loaded
       }
 
-      // Handle mark confirmation — Twilio acks audio played out for a specific
-      // mark name. The playback tracker decrements the matching context's
-      // in-flight counter and may fire a pending hangup once drained + tail.
       else if (data.event === 'mark') {
         const markName = data.mark && data.mark.name;
         playback.ackMark(markName);
@@ -1280,7 +1003,6 @@ exports.handleMediaStream = async (twilioWs, req) => {
     }
   });
 
-  // Handle Twilio WebSocket close
   twilioWs.on('close', async () => {
     console.log('[MediaStream] Client disconnected');
 
@@ -1294,29 +1016,21 @@ exports.handleMediaStream = async (twilioWs, req) => {
     }
     handoffCompleted = true;
 
-    // Remove from global map
     if (global.activeMediaStreams.has(callId)) {
       global.activeMediaStreams.delete(callId);
       console.log('[MediaStream] Removed connection from global map:', callId);
     }
 
-    // Close OpenAI connection
     if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
       openaiWs.close();
     }
 
-    // Update CallSession and save transcript to DB
     if (callSession) {
-      // CRITICAL: データベースから最新の状態を再取得して race condition を回避
-      // 転送処理が別のリクエストで status を更新している可能性があるため
       const latestSession = await CallSession.findById(callSession._id);
       const currentStatus = latestSession ? latestSession.status : callSession.status;
       console.log(`[MediaStream] Current status before disconnect (from DB): ${currentStatus}`);
       console.log(`[MediaStream] Previous in-memory status was: ${callSession.status}`);
 
-      // CRITICAL: 転送中またはhandoff詳細が存在する場合は完了扱いにしない
-      // MediaStream切断のタイミングでstatusがまだ 'transferring' に更新されていないケースがあるため
-      // handoffDetails.requestedAt の存在もチェックする
       const isHandoffInProgress =
         currentStatus === 'transferring' ||
         currentStatus === 'human-connected' ||
@@ -1324,20 +1038,15 @@ exports.handleMediaStream = async (twilioWs, req) => {
 
       if (isHandoffInProgress) {
         console.log('[MediaStream] Call is being transferred or in conference - not marking as completed');
-        console.log(`[MediaStream] Status: ${currentStatus}, HandoffRequested: ${!!latestSession?.handoffDetails?.requestedAt}`);
-        console.log('[MediaStream] Conference call will be marked completed via Conference end event');
-        // トランスクリプトのみ保存、ステータスは変更しない
         if (latestSession && callSession.transcript && callSession.transcript.length > 0) {
           latestSession.transcript = callSession.transcript;
           await latestSession.save();
           console.log(`[MediaStream] Transcript saved, status remains: ${currentStatus}`);
         }
       } else {
-        // 通常のAI通話の場合は完了扱いにする
         callSession.status = 'completed';
         console.log('[MediaStream] Marking call as completed (non-transfer case)');
 
-        // トランスクリプトをDBに一括保存（通話終了時のみ）
         if (callSession.transcript && callSession.transcript.length > 0) {
           console.log('[MediaStream] Saving transcript to DB:', {
             callId: callSession._id.toString(),
@@ -1348,7 +1057,6 @@ exports.handleMediaStream = async (twilioWs, req) => {
         await callSession.save();
         console.log('[MediaStream] CallSession saved with transcript');
 
-        // Notify frontend via WebSocket - call ended（ユーザー専用ルームに送信）
         if (global.io && callSession.userId) {
           const eventData = {
             customerId: callSession.customerId?.toString() || callSession.customerId,
@@ -1365,13 +1073,11 @@ exports.handleMediaStream = async (twilioWs, req) => {
     }
   });
 
-  // Handle Twilio WebSocket errors
   twilioWs.on('error', (error) => {
     console.error('[MediaStream] Twilio WebSocket error:', error.message);
   });
 
   try {
-    // Load CallSession from database
     callSession = await CallSession.findById(callId).populate('assignedAgent');
 
     if (!callSession) {
@@ -1382,7 +1088,6 @@ exports.handleMediaStream = async (twilioWs, req) => {
 
     console.log('[MediaStream] CallSession loaded:', callSession._id);
 
-    // Load AgentSettings
     let agentSettings = null;
     if (callSession.assignedAgent) {
       agentSettings = await AgentSettings.findOne({ userId: callSession.assignedAgent._id });
@@ -1399,9 +1104,7 @@ exports.handleMediaStream = async (twilioWs, req) => {
     }
 
     const temperature = agentSettings?.temperature || 0.8;
-    // Cartesia音声ID（AgentSettingsで設定された声を優先、なければ環境変数）
     const cartesiaVoiceId = agentSettings?.cartesiaVoiceId || CARTESIA_VOICE_ID_DEFAULT;
-    // 話す速度をCartesiaのspeedパラメータに変換
     const speechRateMap = { slow: 0.8, normal: 1.0, fast: 1.2 };
     const cartesiaSpeed = speechRateMap[agentSettings?.conversationSettings?.speechRate] || null;
     const openaiUrl = `wss://api.openai.com/v1/realtime?model=gpt-realtime&temperature=${temperature}`;
@@ -1414,40 +1117,21 @@ exports.handleMediaStream = async (twilioWs, req) => {
       }
     });
 
-    // Handle OpenAI WebSocket connection open
     openaiWs.on('open', async () => {
       console.log('[OpenAI] Connected to Realtime API');
 
-      // Initialize session (official sample line 74)
       await initializeSession(openaiWs, agentSettings);
 
-      // Create Cartesia TTS WebSocket for this call.
-      // Callbacks make the playback tracker the single source of truth:
-      //   onChunk        — forward audio to Twilio AND enqueue a per-chunk mark
-      //   onContextDone  — Cartesia finalized this context (drain check)
       cartesiaWs = createCartesiaWs(twilioWs, () => streamSid, {
-        // ORDER (critical for drain accuracy — see Codex review #1):
-        //   1. Validate context is still live (peek, no mutation)
-        //   2. Validate Twilio ws + streamSid are usable
-        //   3. SEND MEDIA first (this is what Twilio plays)
-        //   4. recordChunk() to allocate a mark seq + push to markQueue
-        //   5. sendChunkMark() to actually emit the mark frame
-        //   6. If mark send fails → rollbackChunk() to release the slot
-        //
-        // Doing recordChunk BEFORE the media send used to inflate marks for
-        // audio that never reached Twilio, which delayed every hangup by up
-        // to CARTESIA_DRAIN_TIMEOUT_MS (15s).
         onChunk: ({ ctxId, payload }) => {
           const sid = streamSid;
           if (!sid) return;
           if (!twilioWs || twilioWs.readyState !== WebSocket.OPEN) return;
           if (!playback.canAcceptChunk(ctxId)) {
-            // Same log line emitted by the tracker for consistency.
             console.log('[barge-in] stale cartesia chunk dropped ctx=' + ctxId);
             return;
           }
 
-          // 3. Forward audio to Twilio first.
           try {
             twilioWs.send(JSON.stringify({
               event: 'media',
@@ -1456,17 +1140,14 @@ exports.handleMediaStream = async (twilioWs, req) => {
             }));
           } catch (e) {
             console.error('[Cartesia→Twilio] media send error:', e.message);
-            return; // never allocate a mark for audio Twilio didn't receive
+            return;
           }
 
-          // 4. Allocate and push the mark — tracker now reflects in-flight audio.
           const markName = playback.recordChunk(ctxId);
-          if (!markName) return; // race: ctx invalidated between peek and now
+          if (!markName) return;
 
-          // 5. Send the mark frame.
           const sent = sendChunkMark(twilioWs, sid, markName);
           if (!sent) {
-            // 6. Rollback so drain isn't blocked by a mark Twilio will never ack.
             console.warn('[Cartesia→Twilio] mark send failed, rolling back', markName);
             playback.rollbackChunk(markName);
           }
@@ -1480,12 +1161,9 @@ exports.handleMediaStream = async (twilioWs, req) => {
         }
       });
 
-      // Update CallSession
       callSession.realtimeSessionId = 'session-' + Date.now();
       await callSession.save();
 
-      // Notify frontend via WebSocket - call started (calling status)（ユーザー専用ルームに送信）
-      // This is sent here to avoid race condition where 'start' event arrives before callSession is loaded
       if (global.io && callSession.userId) {
         const eventData = {
           customerId: callSession.customerId?.toString() || callSession.customerId,
@@ -1498,15 +1176,13 @@ exports.handleMediaStream = async (twilioWs, req) => {
         console.log(`[WebSocket] Emitted callStatusUpdate to user ${callSession.userId}: calling`, JSON.stringify(eventData));
       }
 
-      // Register connection in global map for handoff support
       global.activeMediaStreams.set(callId, {
         twilioWs,
         openaiWs,
-        streamSid: null // Will be set when 'start' event is received
+        streamSid: null
       });
       console.log('[MediaStream] Registered connection in global map:', callId);
 
-      // 接続直後から沈黙タイマー開始（最初から無音のケース対応）
       console.log('[SilenceDetection] Starting initial silence timer (30s) after connection');
       customerSilenceTimer = setTimeout(() => {
         console.log('[SilenceDetection] Initial 30 seconds of silence detected');
@@ -1536,7 +1212,6 @@ exports.handleMediaStream = async (twilioWs, req) => {
       }, 30000);
     });
 
-    // Handle OpenAI WebSocket errors
     openaiWs.on('error', (error) => {
       console.error('[OpenAI] WebSocket error:', error.message);
       console.error('[OpenAI] Error details:', error);
@@ -1550,7 +1225,6 @@ exports.handleMediaStream = async (twilioWs, req) => {
       }
     });
 
-    // Handle OpenAI WebSocket close
     openaiWs.on('close', (code, reason) => {
       console.log('[OpenAI] WebSocket closed, code:', code, 'reason:', reason?.toString());
 
@@ -1573,26 +1247,19 @@ exports.handleMediaStream = async (twilioWs, req) => {
       }
     });
 
-    // Receive messages from OpenAI → Send to Twilio
-    // Reference: official sample line 110-146
     openaiWs.on('message', async (data) => {
       try {
         const response = JSON.parse(data.toString());
 
-        // TEMPORARY DEBUG: Log ALL event types to identify function calling events
         if (response.type && response.type.includes('function') || response.type && response.type.includes('output_item')) {
           console.log('[OpenAI DEBUG] Event type:', response.type);
           console.log('[OpenAI DEBUG] Full response:', JSON.stringify(response, null, 2));
         }
 
-        // Log important events (official sample line 116-117)
         if (LOG_EVENT_TYPES.includes(response.type)) {
           console.log('[OpenAI] Event:', response.type, response);
         }
 
-        // Handle text delta from OpenAI (text output mode → Cartesia TTS)
-        // GA は 'response.output_text.delta'、beta は 'response.text.delta'。
-        // 両方が同じ delta で発火するケースがあるため、最初に来たイベント名のみを採用する（重複防止）
         const isDeltaCandidate = (response.type === 'response.text.delta' ||
                                   response.type === 'response.output_text.delta') && response.delta;
         if (isDeltaCandidate) {
@@ -1609,7 +1276,6 @@ exports.handleMediaStream = async (twilioWs, req) => {
             customerSilenceTimer = null;
           }
 
-          // 新しい assistant item ごとに context_id を発行する。
           if (response.item_id && response.item_id !== lastAssistantItem) {
             responseStartTimestamp = latestMediaTimestamp;
             lastAssistantItem = response.item_id;
@@ -1617,20 +1283,15 @@ exports.handleMediaStream = async (twilioWs, req) => {
             cartesiaContextId = createCartesiaContextId(currentResponseId, response.item_id);
             playback.startContext(cartesiaContextId);
             console.log('[Text] New assistant item:', response.item_id, '→ Cartesia context:', cartesiaContextId);
-// ── フィラー挿入（2ターン目以降のみ）──
-            const FILLERS = ['はい。', 'そうですね。'];
-            const conversationLen = callSession?.realtimeConversation?.length || 0;
-            if (conversationLen >= 1 && !pendingHandoff && !pendingCallEnd) {
-              const filler = FILLERS[Math.floor(Math.random() * FILLERS.length)];
-              sendToCartesia(cartesiaWs, filler, cartesiaContextId, true, cartesiaVoiceId, cartesiaSpeed);
-              console.log('[Filler] Inserted:', filler);
-            }
-            // ──────────────────────────────────────
 
-            // While a handoff is awaiting its announcement (response B), bind the
-            // pending hangup to the freshly-created announcement context. RE-BIND
-            // on every new assistant item so if the model emits a clarifying line
-            // before the real 少々お待ちください, the hangup binds to the LAST item.
+            // ── フィラー挿入：顧客が直前に話した場合のみ「はい。」を挿入 ──
+            if (customerJustSpoke && !pendingHandoff && !pendingCallEnd) {
+              sendToCartesia(cartesiaWs, 'はい。', cartesiaContextId, true, cartesiaVoiceId, cartesiaSpeed);
+              console.log('[Filler] Inserted: はい。');
+              customerJustSpoke = false; // リセット
+            }
+            // ─────────────────────────────────────────────────────────────
+
             if (pendingHandoff && handoffAwaitingAnnouncementCtx) {
               if (scheduledHandoffCtxId && scheduledHandoffCtxId !== cartesiaContextId) {
                 playback.cancelScheduledHangup(scheduledHandoffCtxId);
@@ -1662,58 +1323,34 @@ exports.handleMediaStream = async (twilioWs, req) => {
 
           textBuffer += response.delta;
 
-          // Japanese sentence boundaries: only 。！？ (skip 、 to avoid mid-sentence splits)
-          // 同じ context_id + continue: true で送ることで Cartesia がストリーミングとして処理し、
-          // 文と文の間に隙間が生じない（途切れ防止）
-          //
-          // NOTE: marks are NOT enqueued here. Marks are now enqueued by the
-          // Cartesia chunk handler (playback.recordChunk) so markQueue tracks
-          // actual audio queued at Twilio, not text frames sent upstream.
           const sentenceEnd = /[。！？!?]\s*$/.test(textBuffer) && textBuffer.length >= 8;
           const pausePoint = /[、,]\s*$/.test(textBuffer) && textBuffer.length >= 20;
           if (sentenceEnd || pausePoint || textBuffer.length >= 60) {
-            sendToCartesia(cartesiaWs, textBuffer, cartesiaContextId, true /* continue */, cartesiaVoiceId, cartesiaSpeed);
+            sendToCartesia(cartesiaWs, textBuffer, cartesiaContextId, true, cartesiaVoiceId, cartesiaSpeed);
             textBuffer = '';
           }
         }
 
-        // Handle response done: flush remaining buffer + finalize Cartesia context
         const isTextDone = response.type === 'response.text.done' ||
                            response.type === 'response.output_text.done';
         if (isTextDone && cartesiaContextId) {
-          // 残バッファがあれば continue: true で送り、その後 continue: false で context を閉じる
           if (textBuffer.trim()) {
             sendToCartesia(cartesiaWs, textBuffer, cartesiaContextId, true);
             textBuffer = '';
           }
-          // Cartesia に「もう入力なし、生成を終了して」と通知
-          // (Cartesia will emit a `done` message back, which playback tracker uses to drain.)
-          sendToCartesia(cartesiaWs, '', cartesiaContextId, false /* end */);
+          sendToCartesia(cartesiaWs, '', cartesiaContextId, false);
           lastCompletedCtxId = cartesiaContextId;
           cartesiaContextId = null;
         }
 
-        // Handle user speech start - trigger interruption.
-        //
-        // Barge-in policy (no longer gated on markQueue.length):
-        //   If AI is still producing OR any cartesia context is open OR any
-        //   marks are still in-flight at Twilio, we must interrupt:
-        //     1. response.cancel to OpenAI
-        //     2. invalidate current Cartesia context (so further chunks are dropped)
-        //     3. clear Twilio audio buffer
-        //     4. drop any pending hangup tied to that context
         if (response.type === 'input_audio_buffer.speech_started') {
           console.log('[barge-in] speech_started');
-          speechStartedAt = new Date(); // 発話開始時刻を記録
+          speechStartedAt = new Date();
 
           const shouldInterrupt =
             playback.isAiResponseActive() ||
-            !!cartesiaContextId ||
-            markQueue.length > 0 ||
-            pendingHandoff !== null ||
-            pendingCallEnd !== null;
+            !!cartesiaContextId;
 
-          // 進行中のテキストバッファを常に破棄
           textBuffer = '';
 
           if (customerSilenceTimer) {
@@ -1727,7 +1364,6 @@ exports.handleMediaStream = async (twilioWs, req) => {
             return;
           }
 
-          // 1. Cancel OpenAI generation immediately.
           if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
             try {
               openaiWs.send(JSON.stringify({ type: 'response.cancel' }));
@@ -1737,8 +1373,6 @@ exports.handleMediaStream = async (twilioWs, req) => {
             }
           }
 
-          // 2. Finalize + invalidate the current cartesia context so any
-          //    future chunks for it are dropped by the playback tracker.
           if (cartesiaContextId) {
             try {
               sendToCartesia(cartesiaWs, '', cartesiaContextId, false);
@@ -1749,7 +1383,6 @@ exports.handleMediaStream = async (twilioWs, req) => {
           playback.invalidateAll('speech_started');
           console.log('[barge-in] cartesia context invalidated');
 
-          // 3. Tell Twilio to flush any audio still buffered for playback.
           if (twilioWs && twilioWs.readyState === WebSocket.OPEN && streamSid) {
             try {
               twilioWs.send(JSON.stringify({ event: 'clear', streamSid }));
@@ -1759,12 +1392,6 @@ exports.handleMediaStream = async (twilioWs, req) => {
             }
           }
 
-          // 4. Drop any pending hangup/handoff — user is talking, don't act.
-          //    BUT: once the handoff announcement is LIVE (ctxId bound), a
-          //    transient speech_started must NOT abort the transfer. The
-          //    terminating-guarded invalidateAll (above) preserves+fires the
-          //    bound hangup so the handoff completes after drain. Only a
-          //    PRE-announcement barge-in (no ctxId yet) aborts.
           if (pendingHandoff) {
             if (!pendingHandoff.ctxId) {
               console.log('[barge-in] dropping pendingHandoff (announcement not started)');
@@ -1788,45 +1415,35 @@ exports.handleMediaStream = async (twilioWs, req) => {
           responseStartTimestamp = null;
         }
 
-        // Save user input from input_audio_buffer.committed event
         if (response.type === 'input_audio_buffer.committed' && response.item_id) {
-          // User speech was committed - save as user message
-          // Note: Transcript not available yet, will be updated when response includes it
           console.log('[Conversation] User speech committed:', response.item_id);
         }
 
-        // Handle user speech transcription
         if (response.type === 'conversation.item.input_audio_transcription.completed') {
           const transcript = response.transcript;
           const itemId = response.item_id;
 
-          console.log('[User Transcription] Completed:', {
-            itemId: itemId,
-            transcript: transcript
-          });
+          console.log('[User Transcription] Completed:', { itemId, transcript });
 
           if (transcript && transcript.length > 0) {
-            // Save user speech to realtimeConversation
+            // ── 顧客が話したフラグをセット ──
+            customerJustSpoke = true;
+
             callSession.realtimeConversation.push({
               type: 'message',
               role: 'user',
-              content: [{
-                type: 'input_audio',
-                transcript: transcript
-              }],
+              content: [{ type: 'input_audio', transcript }],
               timestamp: new Date()
             });
 
             await callSession.save();
             console.log('[User Transcription] Saved to database');
 
-            // Send via WebSocket（発話開始時刻を使用、なければ現在時刻）
             sendConversationUpdate(callSession, 'user', transcript, speechStartedAt || new Date());
-            speechStartedAt = null; // リセット
+            speechStartedAt = null;
           }
         }
 
-        // Save conversation from conversation.item.created event (includes both user and assistant)
         if (response.type === 'conversation.item.created' && response.item) {
           const item = response.item;
           console.log('[Conversation] Item created:', {
@@ -1836,7 +1453,6 @@ exports.handleMediaStream = async (twilioWs, req) => {
             hasContent: !!item.content
           });
 
-          // Save items with content (user or assistant messages)
           if (item.role && item.content && item.content.length > 0) {
             callSession.realtimeConversation.push({
               type: item.type || 'message',
@@ -1850,11 +1466,9 @@ exports.handleMediaStream = async (twilioWs, req) => {
           }
         }
 
-        // Save conversation items to database from response.done event
         if (response.type === 'response.done' && response.response) {
           const resp = response.response;
 
-          // Save each output item from the response (assistant messages)
           if (resp.output && resp.output.length > 0) {
             for (const item of resp.output) {
               if (item.role && item.content) {
@@ -1867,11 +1481,10 @@ exports.handleMediaStream = async (twilioWs, req) => {
                 callSession.realtimeConversation.push({
                   type: item.type || 'message',
                   role: item.role,
-                  content: item.content,  // Store as array
+                  content: item.content,
                   timestamp: new Date()
                 });
 
-                // Extract text and send via WebSocket
                 const text = extractTextFromContent(item.content);
                 console.log('[Conversation] Extracted text:', text || '(empty)', 'from content types:', item.content.map(c => c.type).join(', '));
                 if (text) {
@@ -1884,24 +1497,13 @@ exports.handleMediaStream = async (twilioWs, req) => {
             console.log('[Conversation] Saved to database, total items:', callSession.realtimeConversation.length);
           }
 
-          // Start customer silence timer after AI completes speaking
-          // This ensures we check for customer response after every AI utterance
           if (!pendingHandoff && !pendingCallEnd) {
-            // Clear any existing timer
             if (customerSilenceTimer) {
               clearTimeout(customerSilenceTimer);
               console.log('[SilenceDetection] Cleared previous timer');
             }
 
-            // Determine timeout based on check count
-            let timeoutDuration;
-            if (customerSilenceCheckCount === 0) {
-              timeoutDuration = 30000; // 30 seconds for first check
-            } else if (customerSilenceCheckCount === 1) {
-              timeoutDuration = 30000; // 30 seconds for second check
-            } else {
-              timeoutDuration = 30000; // 30 seconds for final check
-            }
+            let timeoutDuration = 30000;
 
             console.log(`[SilenceDetection] Starting timer (check ${customerSilenceCheckCount + 1}, ${timeoutDuration}ms) after AI response completion`);
 
@@ -1925,9 +1527,7 @@ exports.handleMediaStream = async (twilioWs, req) => {
                     }
                   };
                   openaiWs.send(JSON.stringify(systemMessage));
-
-                  const responseCreate = { type: 'response.create' };
-                  openaiWs.send(JSON.stringify(responseCreate));
+                  openaiWs.send(JSON.stringify({ type: 'response.create' }));
                 }
               } else if (customerSilenceCheckCount === 1) {
                 console.log('[SilenceDetection] Sending second check message');
@@ -1946,13 +1546,11 @@ exports.handleMediaStream = async (twilioWs, req) => {
                     }
                   };
                   openaiWs.send(JSON.stringify(systemMessage));
-
-                  const responseCreate = { type: 'response.create' };
-                  openaiWs.send(JSON.stringify(responseCreate));
+                  openaiWs.send(JSON.stringify({ type: 'response.create' }));
                 }
               } else {
                 console.log('[SilenceDetection] Sending final termination message');
-                customerSilenceCheckCount = 0; // Reset
+                customerSilenceCheckCount = 0;
 
                 if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
                   const systemMessage = {
@@ -1967,17 +1565,12 @@ exports.handleMediaStream = async (twilioWs, req) => {
                     }
                   };
                   openaiWs.send(JSON.stringify(systemMessage));
-
-                  const responseCreate = { type: 'response.create' };
-                  openaiWs.send(JSON.stringify(responseCreate));
+                  openaiWs.send(JSON.stringify({ type: 'response.create' }));
                 }
               }
             }, timeoutDuration);
           }
 
-          // Handoff completion is scheduled when the announcement context binds.
-          // response.done only closes the re-bind window; it must not schedule a
-          // second callback or restore the pre-bind fallback timer.
           if (pendingHandoff) {
             const ctxId = pendingHandoff.ctxId;
             if (!ctxId || lastCompletedCtxId !== ctxId) {
@@ -1988,9 +1581,6 @@ exports.handleMediaStream = async (twilioWs, req) => {
             }
           }
 
-          // pendingCallEnd is now handled at function_call time via
-          // handleDeterministicCallEnd (see below). We keep this branch as a
-          // safety net in case future code paths re-introduce the old flow.
           if (pendingCallEnd) {
             console.warn('[AutoCallEnd] legacy pendingCallEnd path triggered — falling back to deterministic close');
             const endData = pendingCallEnd;
@@ -2017,7 +1607,6 @@ exports.handleMediaStream = async (twilioWs, req) => {
           }
         }
 
-        // Handle Function Calling - Auto Handoff
         if (response.type === 'response.output_item.done' && response.item) {
           const item = response.item;
           console.log('[FunctionCall] Detected output_item.done:', item.type);
@@ -2025,21 +1614,16 @@ exports.handleMediaStream = async (twilioWs, req) => {
           if (item.type === 'function_call' && item.name === 'transfer_to_human') {
             console.log('[FunctionCall] Transfer function called by AI');
             console.log('[FunctionCall] Arguments:', item.arguments);
-            console.log('[FunctionCall] Storing for execution after AI response completes');
 
-            // Store function call info to execute AFTER AI finishes speaking
             try {
               const args = JSON.parse(item.arguments);
               pendingHandoff = {
                 callId: item.call_id,
                 args: args,
-                // Bound later to the announcement (response B) cartesia context.
                 ctxId: null
               };
               handoffAwaitingAnnouncementCtx = true;
 
-              // Guard only the pre-bind window. Once an announcement context
-              // starts, its drain timeout owns bounded completion.
               if (handoffFallbackTimer) clearTimeout(handoffFallbackTimer);
               handoffFallbackTimer = setTimeout(() => {
                 if (!handoffCompleted) {
@@ -2048,7 +1632,6 @@ exports.handleMediaStream = async (twilioWs, req) => {
                 }
               }, HANDOFF_ANNOUNCE_FALLBACK_MS);
 
-              // Send success result back to OpenAI immediately so it can generate response
               if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
                 const functionOutput = {
                   type: 'conversation.item.create',
@@ -2063,12 +1646,7 @@ exports.handleMediaStream = async (twilioWs, req) => {
                 };
                 openaiWs.send(JSON.stringify(functionOutput));
                 console.log('[FunctionCall] Sent function result to OpenAI (handoff pending)');
-
-                // Request AI to generate response
-                const responseCreate = {
-                  type: 'response.create'
-                };
-                openaiWs.send(JSON.stringify(responseCreate));
+                openaiWs.send(JSON.stringify({ type: 'response.create' }));
               }
             } catch (error) {
               console.error('[FunctionCall] Error parsing function arguments:', error);
@@ -2079,7 +1657,6 @@ exports.handleMediaStream = async (twilioWs, req) => {
                 handoffFallbackTimer = null;
               }
 
-              // Send error back to OpenAI
               if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
                 const functionOutput = {
                   type: 'conversation.item.create',
@@ -2098,11 +1675,6 @@ exports.handleMediaStream = async (twilioWs, req) => {
             }
           }
 
-          // Handle Function Calling - Auto Call End on Rejection
-          // Deterministic closing: we DO NOT ask OpenAI to generate a goodbye
-          // (response.create is intentionally skipped). Instead we inject the
-          // standardized rejection phrase directly to Cartesia and only hangup
-          // after that audio has actually drained (verified by Twilio marks).
           else if (item.type === 'function_call' && item.name === 'end_call_on_rejection') {
             console.log('[FunctionCall] 顧客拒否検知 - deterministic closing で切電');
             handleDeterministicCallEnd({
@@ -2116,15 +1688,11 @@ exports.handleMediaStream = async (twilioWs, req) => {
             });
           }
 
-          // Handle Function Calling - Auto Call End on Voicemail
-          // Voicemail: do NOT speak a goodbye phrase (we don't want to leave a
-          // message). We still wait for any in-flight audio to drain (rare —
-          // usually nothing) plus the tail buffer to avoid mid-syllable cut.
           else if (item.type === 'function_call' && item.name === 'end_call_on_voicemail') {
             console.log('[FunctionCall] 留守番電話検知 - silent close で切電');
             handleDeterministicCallEnd({
               endType: 'voicemail',
-              phrase: CLOSING_PHRASES.voicemail, // null → no audio injected
+              phrase: CLOSING_PHRASES.voicemail,
               item,
               openaiWs,
               cartesiaWs,
@@ -2134,7 +1702,6 @@ exports.handleMediaStream = async (twilioWs, req) => {
             });
           }
 
-          // Handle Function Calling - Auto Call End on No Response
           else if (item.type === 'function_call' && item.name === 'end_call_on_no_response') {
             console.log('[FunctionCall] 顧客無応答検知 - deterministic closing で切電');
             handleDeterministicCallEnd({
@@ -2149,7 +1716,6 @@ exports.handleMediaStream = async (twilioWs, req) => {
             });
           }
 
-          // Handle Function Calling - Auto Call End on Absent
           else if (item.type === 'function_call' && item.name === 'end_call_on_absent') {
             console.log('[FunctionCall] 担当者不在検知 - deterministic closing で切電');
             handleDeterministicCallEnd({
@@ -2170,8 +1736,6 @@ exports.handleMediaStream = async (twilioWs, req) => {
       }
     });
 
-    // Twilio event handlers are registered at the top of this function
-
   } catch (error) {
     console.error('[MediaStream] Error in handleMediaStream:', error.message);
     console.error('[MediaStream] Stack:', error.stack);
@@ -2186,7 +1750,6 @@ exports.handleMediaStream = async (twilioWs, req) => {
   }
 };
 
-// Export internal functions for testing
 exports.executeAutoCallEnd = executeAutoCallEnd;
 exports.executeAutoCallEndOnNoResponse = executeAutoCallEndOnNoResponse;
 exports.executeAutoCallEndOnAbsent = executeAutoCallEndOnAbsent;
