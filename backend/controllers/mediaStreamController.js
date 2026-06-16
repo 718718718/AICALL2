@@ -1618,7 +1618,7 @@ exports.handleMediaStream = async (twilioWs, req) => {
             playback.startContext(cartesiaContextId);
             console.log('[Text] New assistant item:', response.item_id, '→ Cartesia context:', cartesiaContextId);
 // ── フィラー挿入（2ターン目以降のみ）──
-            const FILLERS = ['はい。', 'そうですね。', 'なるほど。'];
+            const FILLERS = ['はい。', 'そうですね。'];
             const conversationLen = callSession?.realtimeConversation?.length || 0;
             if (conversationLen >= 1 && !pendingHandoff && !pendingCallEnd) {
               const filler = FILLERS[Math.floor(Math.random() * FILLERS.length)];
