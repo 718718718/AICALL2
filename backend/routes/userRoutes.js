@@ -25,7 +25,8 @@ router.get('/', protect, authorize('admin'), async (req, res) => {
 router.put('/sales-pitch', protect, async (req, res) => {
   try {
     const userId = req.user.id;
-    const { voice, conversationSettings } = req.body;
+    // ✅ cartesiaVoiceId と cartesiaVoiceGender を追加
+    const { voice, cartesiaVoiceId, cartesiaVoiceGender, conversationSettings } = req.body;
 
     if (!conversationSettings) {
       return res.status(400).json({
@@ -35,13 +36,9 @@ router.put('/sales-pitch', protect, async (req, res) => {
     }
 
     const {
-      // 基本設定
       companyName, serviceName, representativeName, targetDepartment,
-      // その他設定
       serviceDescription, targetPerson,
-      // AI設定
       conversationStyle, speechRate,
-      // セールスピッチ設定
       salesPitch
     } = conversationSettings;
 
@@ -51,6 +48,8 @@ router.put('/sales-pitch', protect, async (req, res) => {
     console.log('[Sales Pitch Update] Data:', req.body);
     console.log('[Sales Pitch Update] Received fields:', {
       voice,
+      cartesiaVoiceId,
+      cartesiaVoiceGender,
       companyName,
       serviceName,
       representativeName,
@@ -64,7 +63,6 @@ router.put('/sales-pitch', protect, async (req, res) => {
       keyBenefits
     });
 
-    // Find or create agent settings
     let agentSettings = await AgentSettings.findOne({ userId });
 
     if (!agentSettings) {
@@ -80,7 +78,6 @@ router.put('/sales-pitch', protect, async (req, res) => {
         });
       }
 
-      // Create agent settings if they don't exist
       agentSettings = await AgentSettings.create({
         userId: userId,
         conversationSettings: {
@@ -94,7 +91,6 @@ router.put('/sales-pitch', protect, async (req, res) => {
       console.log(`[Sales Pitch PUT] Created agent settings: ${agentSettings._id}`);
     }
 
-    // Update basic settings
     if (companyName !== undefined) {
       agentSettings.conversationSettings.companyName = companyName;
     }
@@ -107,16 +103,12 @@ router.put('/sales-pitch', protect, async (req, res) => {
     if (targetDepartment !== undefined) {
       agentSettings.conversationSettings.targetDepartment = targetDepartment;
     }
-
-    // Update other settings
     if (serviceDescription !== undefined) {
       agentSettings.conversationSettings.serviceDescription = serviceDescription;
     }
     if (targetPerson !== undefined) {
       agentSettings.conversationSettings.targetPerson = targetPerson;
     }
-
-    // Update AI settings
     if (conversationStyle !== undefined) {
       agentSettings.conversationSettings.conversationStyle = conversationStyle;
     }
@@ -124,22 +116,23 @@ router.put('/sales-pitch', protect, async (req, res) => {
       agentSettings.conversationSettings.speechRate = speechRate;
     }
 
-    // Mark conversationSettings as modified for Mongoose
-    if (conversationStyle !== undefined || speechRate !== undefined) {
-      agentSettings.markModified('conversationSettings');
-    }
+    agentSettings.markModified('conversationSettings');
 
-    // Update voice (top-level field in AgentSettings)
     if (voice !== undefined) {
       agentSettings.voice = voice;
     }
 
-    // Initialize salesPitch if it doesn't exist
+    // ✅ cartesiaVoiceId と cartesiaVoiceGender を保存
+    if (cartesiaVoiceId !== undefined) {
+      agentSettings.cartesiaVoiceId = cartesiaVoiceId;
+    }
+    if (cartesiaVoiceGender !== undefined) {
+      agentSettings.cartesiaVoiceGender = cartesiaVoiceGender;
+    }
+
     if (!agentSettings.conversationSettings.salesPitch) {
       agentSettings.conversationSettings.salesPitch = {};
     }
-
-    // Update sales pitch settings
     if (companyDescription !== undefined) {
       agentSettings.conversationSettings.salesPitch.companyDescription = companyDescription;
     }
@@ -150,32 +143,24 @@ router.put('/sales-pitch', protect, async (req, res) => {
       agentSettings.conversationSettings.salesPitch.keyBenefits = keyBenefits;
     }
 
-    // 保存前にデータを確認
     console.log('[Sales Pitch Update] 保存前の設定:');
     console.log('- companyName:', agentSettings.conversationSettings.companyName);
     console.log('- representativeName:', agentSettings.conversationSettings.representativeName);
     console.log('- serviceName:', agentSettings.conversationSettings.serviceName);
     console.log('- voice:', agentSettings.voice);
-    console.log('- conversationStyle:', agentSettings.conversationSettings.conversationStyle);
+    console.log('- cartesiaVoiceId:', agentSettings.cartesiaVoiceId);
+    console.log('- cartesiaVoiceGender:', agentSettings.cartesiaVoiceGender);
     console.log('- speechRate:', agentSettings.conversationSettings.speechRate);
 
-    console.log('[Sales Pitch Update] 保存前のagentSettings:', {
-      id: agentSettings._id,
-      userId: agentSettings.userId,
-      conversationSettings: agentSettings.conversationSettings
-    });
-    
     await agentSettings.save();
     console.log('[Sales Pitch Update] データベースに保存完了');
-    
-    // 保存後に再度読み込んで確認
+
     const savedSettings = await AgentSettings.findById(agentSettings._id);
     console.log('[Sales Pitch Update] 保存後確認:', {
       companyName: savedSettings.conversationSettings.companyName,
-      representativeName: savedSettings.conversationSettings.representativeName,
-      serviceName: savedSettings.conversationSettings.serviceName,
       voice: savedSettings.voice,
-      conversationStyle: savedSettings.conversationSettings.conversationStyle,
+      cartesiaVoiceId: savedSettings.cartesiaVoiceId,
+      cartesiaVoiceGender: savedSettings.cartesiaVoiceGender,
       speechRate: savedSettings.conversationSettings.speechRate
     });
 
@@ -184,6 +169,8 @@ router.put('/sales-pitch', protect, async (req, res) => {
       message: 'トークスクリプト設定が更新されました',
       data: {
         voice: agentSettings.voice,
+        cartesiaVoiceId: agentSettings.cartesiaVoiceId,
+        cartesiaVoiceGender: agentSettings.cartesiaVoiceGender,
         conversationSettings: agentSettings.conversationSettings
       }
     });
@@ -205,7 +192,6 @@ router.get('/sales-pitch', protect, async (req, res) => {
 
     let agentSettings = await AgentSettings.findOne({ userId });
 
-    // If no agent settings exist, create default ones
     if (!agentSettings) {
       console.log(`[Sales Pitch GET] Creating default agent settings for user ${userId}`);
 
@@ -219,7 +205,6 @@ router.get('/sales-pitch', protect, async (req, res) => {
         });
       }
 
-      // Create default agent settings
       agentSettings = await AgentSettings.create({
         userId: userId,
         conversationSettings: {
@@ -235,7 +220,6 @@ router.get('/sales-pitch', protect, async (req, res) => {
       console.log(`[Sales Pitch GET] Created default agent settings: ${agentSettings._id}`);
     }
 
-    // エージェント設定の全データを返す
     res.json({
       success: true,
       data: agentSettings
@@ -287,7 +271,6 @@ router.put('/:id', protect, authorize('admin'), async (req, res) => {
       });
     }
     
-    // Update fields
     if (firstName !== undefined) user.firstName = firstName;
     if (lastName !== undefined) user.lastName = lastName;
     if (phone !== undefined) user.phone = phone;
@@ -295,7 +278,6 @@ router.put('/:id', protect, authorize('admin'), async (req, res) => {
     
     await user.save();
     
-    // Return user without password
     const updatedUser = await User.findById(user._id).select('-password');
     
     res.json({ 
@@ -324,7 +306,6 @@ router.delete('/:id', protect, authorize('admin'), async (req, res) => {
       });
     }
     
-    // Don't allow deleting the last admin
     if (user.role === 'admin') {
       const adminCount = await User.countDocuments({ role: 'admin' });
       if (adminCount <= 1) {
@@ -398,7 +379,6 @@ router.post('/:id/assign-phone', protect, authorize('admin'), async (req, res) =
       });
     }
     
-    // Remove existing assignment if user already has a phone number
     if (user.twilioPhoneNumberSid) {
       await PhonePool.findOneAndUpdate(
         { twilioSid: user.twilioPhoneNumberSid },
@@ -409,7 +389,6 @@ router.post('/:id/assign-phone', protect, authorize('admin'), async (req, res) =
       );
     }
     
-    // Assign new phone number
     phoneNumber.status = 'reserved';
     phoneNumber.assignedTo = {
       userId: user._id,
@@ -417,7 +396,6 @@ router.post('/:id/assign-phone', protect, authorize('admin'), async (req, res) =
     };
     await phoneNumber.save();
     
-    // Update user with new phone number
     user.twilioPhoneNumber = phoneNumber.phoneNumber;
     user.twilioPhoneNumberSid = phoneNumber.twilioSid;
     user.twilioPhoneNumberStatus = 'active';
@@ -451,7 +429,6 @@ router.delete('/:id/unassign-phone', protect, authorize('admin'), async (req, re
     }
     
     if (user.twilioPhoneNumberSid) {
-      // Release the phone number back to the pool
       await PhonePool.findOneAndUpdate(
         { twilioSid: user.twilioPhoneNumberSid },
         { 
@@ -460,7 +437,6 @@ router.delete('/:id/unassign-phone', protect, authorize('admin'), async (req, re
         }
       );
       
-      // Clear phone number from user
       user.twilioPhoneNumber = undefined;
       user.twilioPhoneNumberSid = undefined;
       user.twilioPhoneNumberStatus = undefined;
