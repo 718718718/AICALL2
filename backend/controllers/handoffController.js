@@ -665,7 +665,7 @@ exports.initiateHandoffByPhone = asyncHandler(async (req, res, next) => {
           statusCallbackMethod="POST"
           statusCallbackEvent="start end join leave mute hold">${conferenceName}</Conference>
       </Dial>
-    </Response>`</Dial>
+   </Response>`;
     
     
     // CallSessionからユーザーIDを取得して番号を確認
