@@ -665,9 +665,8 @@ exports.initiateHandoffByPhone = asyncHandler(async (req, res, next) => {
           statusCallbackMethod="POST"
           statusCallbackEvent="start end join leave mute hold">${conferenceName}</Conference>
       </Dial>
-    </Response>`;else {
-      // フォールバック: Polly.Mizukiを使用
-      agentTwiml = `<Response>
+    </Response>`</Dial>
+    </Response>`;
         <Say voice="Polly.Mizuki" language="ja-JP">${agentMessage}</Say>
         <Dial>
           <Conference
