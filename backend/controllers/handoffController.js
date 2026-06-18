@@ -666,21 +666,7 @@ exports.initiateHandoffByPhone = asyncHandler(async (req, res, next) => {
           statusCallbackEvent="start end join leave mute hold">${conferenceName}</Conference>
       </Dial>
     </Response>`</Dial>
-    </Response>`;
-        <Say voice="Polly.Mizuki" language="ja-JP">${agentMessage}</Say>
-        <Dial>
-          <Conference
-            startConferenceOnEnter="true"
-            endConferenceOnExit="true"
-            record="record-from-start"
-            recordingStatusCallback="${getPublicBaseUrl()}/api/twilio/recording/status/${callSession._id}"
-            recordingStatusCallbackMethod="POST"
-            statusCallback="${getPublicBaseUrl()}/api/twilio/conference/events/${callSession._id}"
-            statusCallbackMethod="POST"
-            statusCallbackEvent="start end join leave mute hold">${conferenceName}</Conference>
-        </Dial>
-      </Response>`;
-    }
+    
     
     // CallSessionからユーザーIDを取得して番号を確認
     if (!callSession.assignedAgent) {
