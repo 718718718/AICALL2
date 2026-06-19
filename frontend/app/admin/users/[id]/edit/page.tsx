@@ -43,7 +43,7 @@ export default function EditUserPage({ params }: { params: { id: string } }) {
   const fetchUser = async () => {
     try {
       const token = localStorage.getItem('accessToken');
-      const response = await fetch(`/api/users/${params.id}`, {
+      const response = await fetch(`/api/admin/users/${params.id}`, {
         headers: { 'Authorization': `Bearer ${token}` }
       });
       const data = await response.json();
@@ -68,7 +68,7 @@ export default function EditUserPage({ params }: { params: { id: string } }) {
     setMessage(null);
     try {
       const token = localStorage.getItem('accessToken');
-      const response = await fetch(`/api/users/${params.id}`, {
+      const response = await fetch(`/api/admin/users/${params.id}`, {
         method: 'PUT',
         headers: {
           'Authorization': `Bearer ${token}`,
