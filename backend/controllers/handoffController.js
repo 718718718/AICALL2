@@ -714,14 +714,7 @@ exports.initiateHandoffByPhone = asyncHandler(async (req, res, next) => {
           'handoffDetails.redirectUrl': redirectUrl
         });
         console.log(`[Handoff] Customer redirected to: ${redirectUrl}`);
-      } catch (updateError) {
-        console.error(`[Handoff] Error updating call:`, updateError.message);
-
-        // Redirectが失敗した場合でもConference URLを保存（webhook経由で処理）
-        await CallSession.findByIdAndUpdate(callSession._id, {
-          'handoffDetails.pendingConferenceName': conferenceName,
-          'handoffDetails.redirectUrl': redirectUrl
-        });
+     
 
         console.log(`[Handoff] Saved conference details for webhook processing`);
       }
