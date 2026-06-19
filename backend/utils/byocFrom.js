@@ -1,26 +1,30 @@
 // BYOC（Bring Your Own Carrier）発信パラメータを返すヘルパー。
 //
-// 03番号（日本の地理的番号）は Twilio 自社番号ではないため、`from` に指定して
-// 通常発信すると Twilio が Invalid 'From'（エラー 21212）で拒否する。
-// 03番号を発信元として送出するには、提携キャリア(Voys)の BYOC トランク経由で
-// ルーティングする必要があり、calls.create() に `byoc`（BYOC トランク SID）を
-// 併せて渡さなければならない。
+// ユーザーごとに byocFromNumber / byocTrunkSid が設定されている場合は
+// そのユーザー専用の03/050番号＋BYOCトランク経由で発信する。
+// 未設定の場合は環境変数（BYOC_FROM_NUMBER / BYOC_TRUNK_SID）にフォールバック。
+// それも未設定なら従来通り fallbackFrom（Twilio PSTN番号）で発信する。
 //
-// 安全策（後方互換）:
-//   BYOC_FROM_NUMBER と BYOC_TRUNK_SID の【両方】が設定されている場合のみ
-//   BYOC 発信に切り替える。片方でも未設定なら従来通り（fallbackFrom を使った
-//   Twilio PSTN 発信）に戻すため、設定不備による全発信停止を防げる。
-//   TWILIO_PHONE_NUMBER は一切変更しない（他箇所での副作用を回避）。
-//
-// @param {string} fallbackFrom BYOC 未設定時に使う従来の発信元番号
-// @returns {{from: string, byoc?: string}} calls.create() にスプレッドするパラメータ
-function getByocCallParams(fallbackFrom) {
+// @param {string} fallbackFrom BYOC未設定時に使う従来の発信元番号
+// @param {Object} [user] Userドキュメント（byocFromNumber, byocTrunkSidを含む）
+// @returns {{from: string, byoc?: string}} calls.create()にスプレッドするパラメータ
+function getByocCallParams(fallbackFrom, user = null) {
+  // ✅ 優先1：ユーザー個別のBYOC番号
+  if (user && user.byocFromNumber && user.byocTrunkSid) {
+    console.log(`[BYOC] Using user's BYOC number: ${user.byocFromNumber}`);
+    return { from: user.byocFromNumber, byoc: user.byocTrunkSid };
+  }
+
+  // ✅ 優先2：環境変数のBYOC番号（全体共通）
   const byocFrom = process.env.BYOC_FROM_NUMBER;
   const byocTrunkSid = process.env.BYOC_TRUNK_SID;
-
   if (byocFrom && byocTrunkSid) {
+    console.log(`[BYOC] Using global BYOC number: ${byocFrom}`);
     return { from: byocFrom, byoc: byocTrunkSid };
   }
+
+  // ✅ 優先3：従来のTwilio PSTN番号
+  console.log(`[BYOC] Using fallback number: ${fallbackFrom}`);
   return { from: fallbackFrom };
 }
 
