@@ -69,7 +69,6 @@ const UserSchema = new mongoose.Schema({
     validate: {
       validator: function(v) {
         if (!v) return true;
-        // 日本の電話番号形式（0から始まる10桁または11桁）
         return /^0\d{9,10}$/.test(v.replace(/-/g, ''));
       },
       message: '有効な日本の電話番号を入力してください（例: 09012345678）',
@@ -81,14 +80,13 @@ const UserSchema = new mongoose.Schema({
     default: '',
     maxlength: [50, 'AI call name cannot be more than 50 characters'],
   },
-  // Twilio専用電話番号設定
+  // Twilio専用電話番号設定（米国番号 +1xxx）
   twilioPhoneNumber: {
     type: String,
     trim: true,
     validate: {
       validator: function(v) {
         if (!v) return true;
-        // Twilio番号形式（+1から始まる米国番号）
         return /^\+1\d{10}$/.test(v);
       },
       message: '有効なTwilio電話番号を入力してください（例: +16076956082）',
@@ -102,6 +100,17 @@ const UserSchema = new mongoose.Schema({
     type: String,
     enum: ['active', 'inactive', 'pending'],
     default: 'pending',
+  },
+  // ✅ BYOC番号設定（顧客ごとの03/050番号）
+  byocFromNumber: {
+    type: String,
+    trim: true,
+    // 例: +81368682113
+  },
+  byocTrunkSid: {
+    type: String,
+    trim: true,
+    // 例: BY9cf701873764c0b5cfdda525b19c824f
   },
   refreshToken: {
     type: String,
@@ -131,14 +140,12 @@ const UserSchema = new mongoose.Schema({
   emailVerifiedAt: {
     type: Date,
   },
-  // パスワードリセット機能
   resetPasswordToken: {
     type: String,
   },
   resetPasswordExpires: {
     type: Date,
   },
-  // メールアドレス変更機能
   newEmail: {
     type: String,
     lowercase: true,
@@ -157,50 +164,43 @@ UserSchema.pre('save', async function (next) {
   if (!this.isModified('password')) {
     next();
   }
-  
   const salt = await bcrypt.genSalt(10);
   this.password = await bcrypt.hash(this.password, salt);
   next();
 });
 
-// Method to compare passwords
 UserSchema.methods.comparePassword = async function (enteredPassword) {
   return await bcrypt.compare(enteredPassword, this.password);
 };
 
-// Method to get formatted phone number for Twilio
 UserSchema.methods.getTwilioPhoneNumber = function() {
   if (!this.handoffPhoneNumber) return null;
-  
-  // Remove hyphens and spaces
   let cleaned = this.handoffPhoneNumber.replace(/[-\s]/g, '');
-  
-  // Convert to international format for Japan
   if (cleaned.startsWith('0')) {
     cleaned = '+81' + cleaned.substring(1);
   }
-  
   return cleaned;
 };
 
-// Method to get user's dedicated Twilio phone number for outbound calls
 UserSchema.methods.getDedicatedTwilioNumber = function() {
   return this.twilioPhoneNumber;
 };
 
-// Method to check if user has an active Twilio number
 UserSchema.methods.hasActiveTwilioNumber = function() {
   return this.twilioPhoneNumber && this.twilioPhoneNumberStatus === 'active';
 };
 
-// Method to set refresh token
+// ✅ ユーザーのBYOC番号が設定されているか確認
+UserSchema.methods.hasByocNumber = function() {
+  return !!(this.byocFromNumber && this.byocTrunkSid);
+};
+
 UserSchema.methods.setRefreshToken = async function(token, expiresAt) {
   this.refreshToken = token;
   this.refreshTokenExpiresAt = expiresAt;
   return await this.save();
 };
 
-// Method to clear refresh token
 UserSchema.methods.clearRefreshToken = async function() {
   this.refreshToken = undefined;
   this.refreshTokenExpiresAt = undefined;
