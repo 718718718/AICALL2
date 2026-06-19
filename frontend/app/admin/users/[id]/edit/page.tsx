@@ -1,7 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
-import { useRouter } from 'next/navigation';
+import { useState, useEffect, use } from 'react';
 import Link from 'next/link';
 
 interface User {
@@ -18,36 +17,36 @@ interface User {
   byocTrunkSid?: string;
 }
 
-export default function EditUserPage({ params }: { params: { id: string } }) {
-  const router = useRouter();
+export default function EditUserPage({ params }: { params: Promise<{ id: string }> }) {
+  // ✅ Next.js 15対応: use()でparamsを解決
+  const { id } = use(params);
+
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
-  // 基本情報
   const [firstName, setFirstName] = useState('');
   const [lastName, setLastName] = useState('');
   const [phone, setPhone] = useState('');
   const [role, setRole] = useState<'admin' | 'user'>('user');
 
-  // BYOC番号
   const [byocFromNumber, setByocFromNumber] = useState('');
   const [byocTrunkSid, setByocTrunkSid] = useState('');
   const [savingByoc, setSavingByoc] = useState(false);
 
   useEffect(() => {
-    fetchUser();
-  }, [params.id]);
+    if (id) fetchUser();
+  }, [id]);
 
   const fetchUser = async () => {
     try {
       const token = localStorage.getItem('accessToken');
-      const response = await fetch(`/api/admin/users/${params.id}`, {
+      const response = await fetch(`/api/admin/users/${id}`, {
         headers: { 'Authorization': `Bearer ${token}` }
       });
       const data = await response.json();
-      if (!response.ok) throw new Error(data.error || 'Failed to fetch user');
+      if (!response.ok) throw new Error(data.error || data.message || 'Failed to fetch user');
 
       setUser(data.user);
       setFirstName(data.user.firstName || '');
@@ -68,7 +67,7 @@ export default function EditUserPage({ params }: { params: { id: string } }) {
     setMessage(null);
     try {
       const token = localStorage.getItem('accessToken');
-      const response = await fetch(`/api/admin/users/${params.id}`, {
+      const response = await fetch(`/api/admin/users/${id}`, {
         method: 'PUT',
         headers: {
           'Authorization': `Bearer ${token}`,
@@ -77,7 +76,7 @@ export default function EditUserPage({ params }: { params: { id: string } }) {
         body: JSON.stringify({ firstName, lastName, phone, role })
       });
       const data = await response.json();
-      if (!response.ok) throw new Error(data.error || 'Failed to update user');
+      if (!response.ok) throw new Error(data.error || data.message || 'Failed to update user');
       setMessage({ type: 'success', text: '基本情報を保存しました' });
     } catch (err) {
       setMessage({ type: 'error', text: err instanceof Error ? err.message : 'エラーが発生しました' });
@@ -91,7 +90,7 @@ export default function EditUserPage({ params }: { params: { id: string } }) {
     setMessage(null);
     try {
       const token = localStorage.getItem('accessToken');
-      const response = await fetch(`/api/users/${params.id}/assign-byoc`, {
+      const response = await fetch(`/api/users/${id}/assign-byoc`, {
         method: 'PUT',
         headers: {
           'Authorization': `Bearer ${token}`,
@@ -100,9 +99,10 @@ export default function EditUserPage({ params }: { params: { id: string } }) {
         body: JSON.stringify({ byocFromNumber, byocTrunkSid })
       });
       const data = await response.json();
-      if (!response.ok) throw new Error(data.error || 'Failed to assign BYOC number');
+      if (!response.ok) throw new Error(data.error || data.message || 'Failed to assign BYOC number');
       setMessage({ type: 'success', text: `BYOC番号 ${data.user.byocFromNumber} を設定しました` });
       setByocFromNumber(data.user.byocFromNumber || '');
+      if (user) setUser({ ...user, byocFromNumber: data.user.byocFromNumber });
     } catch (err) {
       setMessage({ type: 'error', text: err instanceof Error ? err.message : 'エラーが発生しました' });
     } finally {
@@ -116,15 +116,16 @@ export default function EditUserPage({ params }: { params: { id: string } }) {
     setMessage(null);
     try {
       const token = localStorage.getItem('accessToken');
-      const response = await fetch(`/api/users/${params.id}/unassign-byoc`, {
+      const response = await fetch(`/api/users/${id}/unassign-byoc`, {
         method: 'DELETE',
         headers: { 'Authorization': `Bearer ${token}` }
       });
       const data = await response.json();
-      if (!response.ok) throw new Error(data.error || 'Failed to unassign BYOC number');
+      if (!response.ok) throw new Error(data.error || data.message || 'Failed to unassign BYOC number');
       setMessage({ type: 'success', text: 'BYOC番号の割り当てを解除しました' });
       setByocFromNumber('');
       setByocTrunkSid('');
+      if (user) setUser({ ...user, byocFromNumber: undefined });
     } catch (err) {
       setMessage({ type: 'error', text: err instanceof Error ? err.message : 'エラーが発生しました' });
     } finally {
@@ -155,57 +156,29 @@ export default function EditUserPage({ params }: { params: { id: string } }) {
           <div className="grid grid-cols-2 gap-4">
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">姓</label>
-              <input
-                type="text"
-                value={lastName}
-                onChange={(e) => setLastName(e.target.value)}
-                className="w-full border rounded px-3 py-2 text-sm"
-              />
+              <input type="text" value={lastName} onChange={(e) => setLastName(e.target.value)} className="w-full border rounded px-3 py-2 text-sm" />
             </div>
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">名</label>
-              <input
-                type="text"
-                value={firstName}
-                onChange={(e) => setFirstName(e.target.value)}
-                className="w-full border rounded px-3 py-2 text-sm"
-              />
+              <input type="text" value={firstName} onChange={(e) => setFirstName(e.target.value)} className="w-full border rounded px-3 py-2 text-sm" />
             </div>
           </div>
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">メール</label>
-            <input
-              type="text"
-              value={user.email}
-              disabled
-              className="w-full border rounded px-3 py-2 text-sm bg-gray-50 text-gray-500"
-            />
+            <input type="text" value={user.email} disabled className="w-full border rounded px-3 py-2 text-sm bg-gray-50 text-gray-500" />
           </div>
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">電話番号</label>
-            <input
-              type="text"
-              value={phone}
-              onChange={(e) => setPhone(e.target.value)}
-              className="w-full border rounded px-3 py-2 text-sm"
-            />
+            <input type="text" value={phone} onChange={(e) => setPhone(e.target.value)} className="w-full border rounded px-3 py-2 text-sm" />
           </div>
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">役割</label>
-            <select
-              value={role}
-              onChange={(e) => setRole(e.target.value as 'admin' | 'user')}
-              className="w-full border rounded px-3 py-2 text-sm"
-            >
+            <select value={role} onChange={(e) => setRole(e.target.value as 'admin' | 'user')} className="w-full border rounded px-3 py-2 text-sm">
               <option value="user">ユーザー</option>
               <option value="admin">管理者</option>
             </select>
           </div>
-          <button
-            onClick={saveBasicInfo}
-            disabled={saving}
-            className="w-full bg-indigo-600 text-white py-2 px-4 rounded hover:bg-indigo-700 disabled:opacity-50"
-          >
+          <button onClick={saveBasicInfo} disabled={saving} className="w-full bg-indigo-600 text-white py-2 px-4 rounded hover:bg-indigo-700 disabled:opacity-50">
             {saving ? '保存中...' : '基本情報を保存'}
           </button>
         </div>
@@ -222,13 +195,7 @@ export default function EditUserPage({ params }: { params: { id: string } }) {
               <span className="text-sm font-medium text-green-800">現在の番号: </span>
               <span className="text-sm text-green-700">{user.byocFromNumber}</span>
             </div>
-            <button
-              onClick={removeByocNumber}
-              disabled={savingByoc}
-              className="text-xs text-red-600 hover:text-red-800 disabled:opacity-50"
-            >
-              解除
-            </button>
+            <button onClick={removeByocNumber} disabled={savingByoc} className="text-xs text-red-600 hover:text-red-800 disabled:opacity-50">解除</button>
           </div>
         )}
 
@@ -236,34 +203,18 @@ export default function EditUserPage({ params }: { params: { id: string } }) {
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">
               03/050番号
-              <span className="text-gray-400 font-normal ml-1">（例: 0368682113 または +81368682113）</span>
+              <span className="text-gray-400 font-normal ml-1">（例: 0368682113）</span>
             </label>
-            <input
-              type="text"
-              value={byocFromNumber}
-              onChange={(e) => setByocFromNumber(e.target.value)}
-              placeholder="0368682113"
-              className="w-full border rounded px-3 py-2 text-sm"
-            />
+            <input type="text" value={byocFromNumber} onChange={(e) => setByocFromNumber(e.target.value)} placeholder="0368682113" className="w-full border rounded px-3 py-2 text-sm" />
           </div>
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">
               BYOCトランクSID
               <span className="text-gray-400 font-normal ml-1">（例: BY9cf701873764c0b5cfdda525b19c824f）</span>
             </label>
-            <input
-              type="text"
-              value={byocTrunkSid}
-              onChange={(e) => setByocTrunkSid(e.target.value)}
-              placeholder="BY9cf701873764c0b5cfdda525b19c824f"
-              className="w-full border rounded px-3 py-2 text-sm font-mono"
-            />
+            <input type="text" value={byocTrunkSid} onChange={(e) => setByocTrunkSid(e.target.value)} placeholder="BY9cf701873764c0b5cfdda525b19c824f" className="w-full border rounded px-3 py-2 text-sm font-mono" />
           </div>
-          <button
-            onClick={saveByocNumber}
-            disabled={savingByoc || !byocFromNumber || !byocTrunkSid}
-            className="w-full bg-green-600 text-white py-2 px-4 rounded hover:bg-green-700 disabled:opacity-50"
-          >
+          <button onClick={saveByocNumber} disabled={savingByoc || !byocFromNumber || !byocTrunkSid} className="w-full bg-green-600 text-white py-2 px-4 rounded hover:bg-green-700 disabled:opacity-50">
             {savingByoc ? '設定中...' : 'BYOC番号を設定'}
           </button>
         </div>
