@@ -1,571 +1,273 @@
 'use client';
 
 import { useState, useEffect } from 'react';
-import { useRouter, useParams } from 'next/navigation';
+import { useRouter } from 'next/navigation';
+import Link from 'next/link';
 
 interface User {
   _id: string;
   firstName: string;
   lastName: string;
   email: string;
-  companyId: string;
   companyName: string;
   phone: string;
-  twilioPhoneNumber?: string;
-  twilioPhoneNumberSid?: string;
-  twilioPhoneNumberStatus?: 'active' | 'inactive' | 'pending';
   role: 'admin' | 'user';
+  twilioPhoneNumber?: string;
+  twilioPhoneNumberStatus?: string;
+  byocFromNumber?: string;
+  byocTrunkSid?: string;
 }
 
-interface Company {
-  _id: string;
-  companyId: string;
-  name: string;
-}
-
-interface AvailablePhoneNumber {
-  _id: string;
-  phoneNumber: string;
-  friendlyName?: string;
-  capabilities: {
-    voice: boolean;
-    sms: boolean;
-    mms: boolean;
-    fax: boolean;
-  };
-}
-
-export default function EditUserPage() {
+export default function EditUserPage({ params }: { params: { id: string } }) {
   const router = useRouter();
-  const params = useParams();
-  const userId = params.id as string;
-
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [availableNumbers, setAvailableNumbers] = useState<AvailablePhoneNumber[]>([]);
-  const [selectedNumberId, setSelectedNumberId] = useState<string>('');
-  const [assigningNumber, setAssigningNumber] = useState(false);
-  const [importingNumbers, setImportingNumbers] = useState(false);
-  const [purchasingNumber, setPurchasingNumber] = useState(false);
-  const [companies, setCompanies] = useState<Company[]>([]);
-  const [selectedCompanyId, setSelectedCompanyId] = useState<string>('');
+  const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+
+  // 基本情報
+  const [firstName, setFirstName] = useState('');
+  const [lastName, setLastName] = useState('');
+  const [phone, setPhone] = useState('');
+  const [role, setRole] = useState<'admin' | 'user'>('user');
+
+  // BYOC番号
+  const [byocFromNumber, setByocFromNumber] = useState('');
+  const [byocTrunkSid, setByocTrunkSid] = useState('');
+  const [savingByoc, setSavingByoc] = useState(false);
 
   useEffect(() => {
-    if (userId) {
-      fetchUser();
-      fetchAvailableNumbers();
-      fetchCompanies();
-    }
-  }, [userId]);
+    fetchUser();
+  }, [params.id]);
 
   const fetchUser = async () => {
     try {
-      const response = await fetch(`/api/users/${userId}`, {
-        headers: {
-          'Authorization': `Bearer ${localStorage.getItem('accessToken')}`,
-        },
+      const token = localStorage.getItem('accessToken');
+      const response = await fetch(`/api/users/${params.id}`, {
+        headers: { 'Authorization': `Bearer ${token}` }
       });
-
-      if (!response.ok) {
-        throw new Error('Failed to fetch user');
-      }
-
       const data = await response.json();
-      const userData = data.user || data;
-      setUser(userData);
-      setSelectedCompanyId(userData.companyId || '');
+      if (!response.ok) throw new Error(data.error || 'Failed to fetch user');
+
+      setUser(data.user);
+      setFirstName(data.user.firstName || '');
+      setLastName(data.user.lastName || '');
+      setPhone(data.user.phone || '');
+      setRole(data.user.role || 'user');
+      setByocFromNumber(data.user.byocFromNumber || '');
+      setByocTrunkSid(data.user.byocTrunkSid || '');
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'An error occurred');
+      setMessage({ type: 'error', text: err instanceof Error ? err.message : 'エラーが発生しました' });
     } finally {
       setLoading(false);
     }
   };
 
-  const fetchAvailableNumbers = async () => {
-    try {
-      const response = await fetch('/api/users/phone-numbers/available', {
-        headers: {
-          'Authorization': `Bearer ${localStorage.getItem('accessToken')}`,
-        },
-      });
-
-      if (response.ok) {
-        const data = await response.json();
-        setAvailableNumbers(data.numbers || []);
-      }
-    } catch (err) {
-      console.error('Failed to fetch available numbers:', err);
-    }
-  };
-
-  const fetchCompanies = async () => {
-    try {
-      const token = localStorage.getItem('accessToken');
-      if (!token) {
-        setError('認証情報の有効期限が切れています');
-        router.push('/admin/login');
-        return;
-      }
-
-      const response = await fetch('/api/companies', {
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Content-Type': 'application/json',
-          'Cache-Control': 'no-cache',
-          'Pragma': 'no-cache',
-        },
-      });
-
-      if (!response.ok) {
-        throw new Error('企業一覧の取得に失敗しました');
-      }
-
-      const data = await response.json();
-      if (!data.success) {
-        throw new Error(data.message || '企業一覧の取得に失敗しました');
-      }
-
-      const activeCompanies = (data.data || []).filter((company: Company & { status?: string }) => 
-        !company.status || company.status === 'active'
-      );
-      setCompanies(activeCompanies);
-    } catch (err) {
-      console.error('Failed to fetch companies:', err);
-      setError(err instanceof Error ? err.message : '企業一覧の取得に失敗しました');
-    }
-  };
-
-  const handleChangeCompany = async () => {
-    if (!selectedCompanyId || !user) return;
-
+  const saveBasicInfo = async () => {
     setSaving(true);
-    setError(null);
-
+    setMessage(null);
     try {
       const token = localStorage.getItem('accessToken');
-      if (!token) {
-        setError('認証情報の有効期限が切れています');
-        router.push('/admin/login');
-        return;
-      }
-
-      const response = await fetch(`/api/company/user/${userId}/assign`, {
+      const response = await fetch(`/api/users/${params.id}`, {
         method: 'PUT',
         headers: {
-          'Content-Type': 'application/json',
           'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json'
         },
-        body: JSON.stringify({
-          companyId: selectedCompanyId,
-        }),
+        body: JSON.stringify({ firstName, lastName, phone, role })
       });
-
       const data = await response.json();
-
-      if (!response.ok || !data.success) {
-        throw new Error(data.message || '企業の紐付けの更新に失敗しました');
-      }
-
-      setUser(data.data.user);
-      alert('企業の紐付けを更新しました');
+      if (!response.ok) throw new Error(data.error || 'Failed to update user');
+      setMessage({ type: 'success', text: '基本情報を保存しました' });
     } catch (err) {
-      console.error('Failed to update company association:', err);
-      setError(err instanceof Error ? err.message : '企業の紐付けの更新に失敗しました');
+      setMessage({ type: 'error', text: err instanceof Error ? err.message : 'エラーが発生しました' });
     } finally {
       setSaving(false);
     }
   };
 
-  const handleAssignPhoneNumber = async () => {
-    if (!selectedNumberId || !user) return;
-
-    setAssigningNumber(true);
-    setError(null);
-
+  const saveByocNumber = async () => {
+    setSavingByoc(true);
+    setMessage(null);
     try {
-      const response = await fetch(`/api/users/${userId}/assign-phone`, {
-        method: 'POST',
+      const token = localStorage.getItem('accessToken');
+      const response = await fetch(`/api/users/${params.id}/assign-byoc`, {
+        method: 'PUT',
         headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${localStorage.getItem('accessToken')}`,
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json'
         },
-        body: JSON.stringify({
-          phoneNumberId: selectedNumberId,
-        }),
+        body: JSON.stringify({ byocFromNumber, byocTrunkSid })
       });
-
-      if (!response.ok) {
-        throw new Error('Failed to assign phone number');
-      }
-
       const data = await response.json();
-      setUser(data.user);
-      setSelectedNumberId('');
-      await fetchAvailableNumbers(); // Refresh available numbers
+      if (!response.ok) throw new Error(data.error || 'Failed to assign BYOC number');
+      setMessage({ type: 'success', text: `BYOC番号 ${data.user.byocFromNumber} を設定しました` });
+      setByocFromNumber(data.user.byocFromNumber || '');
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'An error occurred');
+      setMessage({ type: 'error', text: err instanceof Error ? err.message : 'エラーが発生しました' });
     } finally {
-      setAssigningNumber(false);
+      setSavingByoc(false);
     }
   };
 
-  const handleUnassignPhoneNumber = async () => {
-    if (!user?.twilioPhoneNumberSid) return;
-
-    setAssigningNumber(true);
-    setError(null);
-
+  const removeByocNumber = async () => {
+    if (!confirm('BYOC番号の割り当てを解除しますか？')) return;
+    setSavingByoc(true);
+    setMessage(null);
     try {
-      const response = await fetch(`/api/users/${userId}/unassign-phone`, {
+      const token = localStorage.getItem('accessToken');
+      const response = await fetch(`/api/users/${params.id}/unassign-byoc`, {
         method: 'DELETE',
-        headers: {
-          'Authorization': `Bearer ${localStorage.getItem('accessToken')}`,
-        },
+        headers: { 'Authorization': `Bearer ${token}` }
       });
-
-      if (!response.ok) {
-        throw new Error('Failed to unassign phone number');
-      }
-
       const data = await response.json();
-      setUser(data.user);
-      await fetchAvailableNumbers(); // Refresh available numbers
+      if (!response.ok) throw new Error(data.error || 'Failed to unassign BYOC number');
+      setMessage({ type: 'success', text: 'BYOC番号の割り当てを解除しました' });
+      setByocFromNumber('');
+      setByocTrunkSid('');
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'An error occurred');
+      setMessage({ type: 'error', text: err instanceof Error ? err.message : 'エラーが発生しました' });
     } finally {
-      setAssigningNumber(false);
+      setSavingByoc(false);
     }
   };
 
-  const handleImportFromTwilio = async () => {
-    setImportingNumbers(true);
-    setError(null);
-
-    try {
-      const response = await fetch('/api/users/phone-numbers/import-from-twilio', {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${localStorage.getItem('accessToken')}`,
-        },
-      });
-
-      if (!response.ok) {
-        throw new Error('Failed to import phone numbers from Twilio');
-      }
-
-      const data = await response.json();
-      await fetchAvailableNumbers(); // Refresh available numbers
-      alert(data.message || 'Phone numbers imported successfully');
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'An error occurred');
-    } finally {
-      setImportingNumbers(false);
-    }
-  };
-
-  const handlePurchaseNumber = async () => {
-    setPurchasingNumber(true);
-    setError(null);
-
-    try {
-      const response = await fetch('/api/users/phone-numbers/purchase', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${localStorage.getItem('accessToken')}`,
-        },
-        body: JSON.stringify({
-          areaCode: '607', // デフォルトのエリアコード
-          capabilities: { voice: true, sms: true }
-        }),
-      });
-
-      if (!response.ok) {
-        throw new Error('Failed to purchase phone number from Twilio');
-      }
-
-      const data = await response.json();
-      await fetchAvailableNumbers(); // Refresh available numbers
-      alert(data.message || 'Phone number purchased successfully');
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'An error occurred');
-    } finally {
-      setPurchasingNumber(false);
-    }
-  };
-
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!user) return;
-
-    setSaving(true);
-    setError(null);
-
-    try {
-      const response = await fetch(`/api/users/${userId}`, {
-        method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${localStorage.getItem('accessToken')}`,
-        },
-        body: JSON.stringify({
-          firstName: user.firstName,
-          lastName: user.lastName,
-          phone: user.phone,
-          role: user.role,
-        }),
-      });
-
-      if (!response.ok) {
-        throw new Error('Failed to update user');
-      }
-
-      router.push('/admin/users');
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'An error occurred');
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  if (loading) return <div className="p-8">Loading...</div>;
-  if (error && !user) return <div className="p-8 text-red-500">Error: {error}</div>;
-  if (!user) return <div className="p-8">User not found</div>;
+  if (loading) return <div className="p-8">読み込み中...</div>;
+  if (!user) return <div className="p-8 text-red-500">ユーザーが見つかりません</div>;
 
   return (
-    <div className="p-8">
-      <h1 className="text-2xl font-semibold mb-6">ユーザー編集</h1>
+    <div className="p-8 max-w-2xl mx-auto">
+      <div className="flex items-center gap-4 mb-6">
+        <Link href="/admin/users" className="text-gray-500 hover:text-gray-700">← 戻る</Link>
+        <h1 className="text-2xl font-semibold">ユーザー編集</h1>
+      </div>
 
-      <form onSubmit={handleSubmit} className="bg-white shadow rounded-lg p-6 space-y-4 max-w-2xl">
-        {error && (
-          <div className="bg-red-50 text-red-600 p-3 rounded">
-            {error}
+      {message && (
+        <div className={`mb-4 p-4 rounded ${message.type === 'success' ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'}`}>
+          {message.text}
+        </div>
+      )}
+
+      {/* 基本情報 */}
+      <div className="bg-white shadow rounded-lg p-6 mb-6">
+        <h2 className="text-lg font-medium mb-4">基本情報</h2>
+        <div className="space-y-4">
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">姓</label>
+              <input
+                type="text"
+                value={lastName}
+                onChange={(e) => setLastName(e.target.value)}
+                className="w-full border rounded px-3 py-2 text-sm"
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">名</label>
+              <input
+                type="text"
+                value={firstName}
+                onChange={(e) => setFirstName(e.target.value)}
+                className="w-full border rounded px-3 py-2 text-sm"
+              />
+            </div>
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">メール</label>
+            <input
+              type="text"
+              value={user.email}
+              disabled
+              className="w-full border rounded px-3 py-2 text-sm bg-gray-50 text-gray-500"
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">電話番号</label>
+            <input
+              type="text"
+              value={phone}
+              onChange={(e) => setPhone(e.target.value)}
+              className="w-full border rounded px-3 py-2 text-sm"
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">役割</label>
+            <select
+              value={role}
+              onChange={(e) => setRole(e.target.value as 'admin' | 'user')}
+              className="w-full border rounded px-3 py-2 text-sm"
+            >
+              <option value="user">ユーザー</option>
+              <option value="admin">管理者</option>
+            </select>
+          </div>
+          <button
+            onClick={saveBasicInfo}
+            disabled={saving}
+            className="w-full bg-indigo-600 text-white py-2 px-4 rounded hover:bg-indigo-700 disabled:opacity-50"
+          >
+            {saving ? '保存中...' : '基本情報を保存'}
+          </button>
+        </div>
+      </div>
+
+      {/* BYOC番号設定 */}
+      <div className="bg-white shadow rounded-lg p-6">
+        <h2 className="text-lg font-medium mb-1">BYOC番号設定</h2>
+        <p className="text-sm text-gray-500 mb-4">顧客専用の03/050番号をこのユーザーに割り当てます</p>
+
+        {user.byocFromNumber && (
+          <div className="mb-4 p-3 bg-green-50 border border-green-200 rounded flex items-center justify-between">
+            <div>
+              <span className="text-sm font-medium text-green-800">現在の番号: </span>
+              <span className="text-sm text-green-700">{user.byocFromNumber}</span>
+            </div>
+            <button
+              onClick={removeByocNumber}
+              disabled={savingByoc}
+              className="text-xs text-red-600 hover:text-red-800 disabled:opacity-50"
+            >
+              解除
+            </button>
           </div>
         )}
 
-        <div>
-          <label className="block text-sm font-medium text-gray-700">メールアドレス</label>
-          <input
-            type="email"
-            value={user.email}
-            disabled
-            className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md bg-gray-50"
-          />
-        </div>
-
-        <div>
-          <label className="block text-sm font-medium text-gray-700">所属企業</label>
-          <div className="flex gap-2">
-            <select
-              value={selectedCompanyId}
-              onChange={(e) => setSelectedCompanyId(e.target.value)}
-              className="flex-1 px-3 py-2 border border-gray-300 rounded-md"
-            >
-              <option value="">企業を選択してください</option>
-              {companies.map((company) => (
-                <option key={company._id} value={company.companyId}>
-                  {company.name} ({company.companyId})
-                </option>
-              ))}
-            </select>
-            <button
-              type="button"
-              onClick={handleChangeCompany}
-              disabled={!selectedCompanyId || selectedCompanyId === user.companyId || saving}
-              className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:bg-gray-300 disabled:cursor-not-allowed"
-            >
-              変更
-            </button>
-          </div>
-          <p className="mt-1 text-sm text-gray-500">
-            現在の企業: {user.companyName} (ID: {user.companyId})
-          </p>
-        </div>
-
-        <div className="grid grid-cols-2 gap-4">
+        <div className="space-y-4">
           <div>
-            <label className="block text-sm font-medium text-gray-700">姓</label>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              03/050番号
+              <span className="text-gray-400 font-normal ml-1">（例: 0368682113 または +81368682113）</span>
+            </label>
             <input
               type="text"
-              value={user.lastName}
-              onChange={(e) => setUser({ ...user, lastName: e.target.value })}
-              className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md"
-              required
+              value={byocFromNumber}
+              onChange={(e) => setByocFromNumber(e.target.value)}
+              placeholder="0368682113"
+              className="w-full border rounded px-3 py-2 text-sm"
             />
           </div>
           <div>
-            <label className="block text-sm font-medium text-gray-700">名</label>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              BYOCトランクSID
+              <span className="text-gray-400 font-normal ml-1">（例: BY9cf701873764c0b5cfdda525b19c824f）</span>
+            </label>
             <input
               type="text"
-              value={user.firstName}
-              onChange={(e) => setUser({ ...user, firstName: e.target.value })}
-              className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md"
-              required
+              value={byocTrunkSid}
+              onChange={(e) => setByocTrunkSid(e.target.value)}
+              placeholder="BY9cf701873764c0b5cfdda525b19c824f"
+              className="w-full border rounded px-3 py-2 text-sm font-mono"
             />
           </div>
-        </div>
-
-        <div>
-          <label className="block text-sm font-medium text-gray-700">電話番号</label>
-          <input
-            type="tel"
-            value={user.phone}
-            onChange={(e) => setUser({ ...user, phone: e.target.value })}
-            className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md"
-            required
-          />
-        </div>
-
-        <div>
-          <label className="block text-sm font-medium text-gray-700">役割</label>
-          <select
-            value={user.role}
-            onChange={(e) => setUser({ ...user, role: e.target.value as 'admin' | 'user' })}
-            className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md"
-          >
-            <option value="user">ユーザー</option>
-            <option value="admin">管理者</option>
-          </select>
-        </div>
-
-        {/* Twilio電話番号セクション */}
-        <div className="border-t pt-4">
-          <h3 className="text-lg font-medium text-gray-900 mb-4">Twilio電話番号の管理</h3>
-          
-          {user.twilioPhoneNumber ? (
-            <div className="space-y-4">
-              <div>
-                <label className="block text-sm font-medium text-gray-700">現在の割り当て番号</label>
-                <div className="mt-1 flex items-center space-x-2">
-                  <input
-                    type="text"
-                    value={user.twilioPhoneNumber}
-                    disabled
-                    className="flex-1 px-3 py-2 border border-gray-300 rounded-md bg-gray-50"
-                  />
-                  <span className={`px-2 py-1 text-xs rounded-full ${
-                    user.twilioPhoneNumberStatus === 'active' 
-                      ? 'bg-green-100 text-green-800' 
-                      : 'bg-yellow-100 text-yellow-800'
-                  }`}>
-                    {user.twilioPhoneNumberStatus === 'active' ? 'アクティブ' : user.twilioPhoneNumberStatus}
-                  </span>
-                </div>
-              </div>
-              
-              <button
-                type="button"
-                onClick={handleUnassignPhoneNumber}
-                disabled={assigningNumber}
-                className="px-4 py-2 bg-red-600 text-white text-sm rounded-md hover:bg-red-700 disabled:opacity-50"
-              >
-                {assigningNumber ? '処理中...' : '番号の割り当てを解除'}
-              </button>
-            </div>
-          ) : (
-            <div className="space-y-4">
-              <div>
-                <label className="block text-sm font-medium text-gray-700">電話番号を割り当て</label>
-                <div className="mt-1 flex items-center space-x-2">
-                  <select
-                    value={selectedNumberId}
-                    onChange={(e) => setSelectedNumberId(e.target.value)}
-                    className="flex-1 px-3 py-2 border border-gray-300 rounded-md"
-                    disabled={availableNumbers.length === 0}
-                  >
-                    <option value="">電話番号を選択してください</option>
-                    {availableNumbers.map((number) => (
-                      <option key={number._id} value={number._id}>
-                        {number.phoneNumber}
-                        {number.friendlyName && ` (${number.friendlyName})`}
-                        {number.capabilities.voice && number.capabilities.sms ? ' - 音声・SMS対応' : 
-                         number.capabilities.voice ? ' - 音声のみ' : ' - その他'}
-                      </option>
-                    ))}
-                  </select>
-                  <button
-                    type="button"
-                    onClick={handleAssignPhoneNumber}
-                    disabled={!selectedNumberId || assigningNumber}
-                    className="px-4 py-2 bg-blue-600 text-white text-sm rounded-md hover:bg-blue-700 disabled:opacity-50"
-                  >
-                    {assigningNumber ? '処理中...' : '割り当て'}
-                  </button>
-                </div>
-              </div>
-              
-              {availableNumbers.length === 0 && (
-                <div className="space-y-3">
-                  <p className="text-sm text-yellow-600 bg-yellow-50 p-2 rounded">
-                    利用可能な電話番号がありません。
-                  </p>
-                  
-                  <div className="flex space-x-2">
-                    <button
-                      type="button"
-                      onClick={handleImportFromTwilio}
-                      disabled={importingNumbers}
-                      className="px-4 py-2 bg-green-600 text-white text-sm rounded-md hover:bg-green-700 disabled:opacity-50 flex-1"
-                    >
-                      {importingNumbers ? 'インポート中...' : 'Twilioから既存番号をインポート'}
-                    </button>
-                    
-                    <button
-                      type="button"
-                      onClick={handlePurchaseNumber}
-                      disabled={purchasingNumber}
-                      className="px-4 py-2 bg-purple-600 text-white text-sm rounded-md hover:bg-purple-700 disabled:opacity-50 flex-1"
-                    >
-                      {purchasingNumber ? '購入中...' : '新しい番号を購入'}
-                    </button>
-                  </div>
-                </div>
-              )}
-              
-              {availableNumbers.length > 0 && (
-                <div className="mt-3 flex space-x-2">
-                  <button
-                    type="button"
-                    onClick={handleImportFromTwilio}
-                    disabled={importingNumbers}
-                    className="px-3 py-1 bg-green-600 text-white text-xs rounded-md hover:bg-green-700 disabled:opacity-50"
-                  >
-                    {importingNumbers ? 'インポート中...' : 'Twilioからインポート'}
-                  </button>
-                  
-                  <button
-                    type="button"
-                    onClick={handlePurchaseNumber}
-                    disabled={purchasingNumber}
-                    className="px-3 py-1 bg-purple-600 text-white text-xs rounded-md hover:bg-purple-700 disabled:opacity-50"
-                  >
-                    {purchasingNumber ? '購入中...' : '新しい番号を購入'}
-                  </button>
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-
-        <div className="flex justify-end space-x-4">
           <button
-            type="button"
-            onClick={() => router.push('/admin/users')}
-            className="px-4 py-2 border border-gray-300 rounded-md hover:bg-gray-50"
+            onClick={saveByocNumber}
+            disabled={savingByoc || !byocFromNumber || !byocTrunkSid}
+            className="w-full bg-green-600 text-white py-2 px-4 rounded hover:bg-green-700 disabled:opacity-50"
           >
-            キャンセル
-          </button>
-          <button
-            type="submit"
-            disabled={saving}
-            className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:opacity-50"
-          >
-            {saving ? '保存中...' : '保存'}
+            {savingByoc ? '設定中...' : 'BYOC番号を設定'}
           </button>
         </div>
-      </form>
+      </div>
     </div>
   );
 }
