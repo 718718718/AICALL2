@@ -14,7 +14,7 @@ const CARTESIA_VOICE_ID_DEFAULT = process.env.CARTESIA_VOICE_ID || 'fd1ee8f5-223
 const CARTESIA_MODEL_ID = process.env.CARTESIA_MODEL_ID || 'sonic-3';
 const CARTESIA_API_VERSION = process.env.CARTESIA_API_VERSION || '2026-03-01';
 
-const CARTESIA_TAIL_MS = parseInt(process.env.CARTESIA_TAIL_MS || '700', 10);
+const CARTESIA_TAIL_MS = parseInt(process.env.CARTESIA_TAIL_MS || '1500', 10);
 const CARTESIA_DRAIN_TIMEOUT_MS = parseInt(process.env.CARTESIA_DRAIN_TIMEOUT_MS || '15000', 10);
 
 const HANDOFF_ANNOUNCE_FALLBACK_MS = parseInt(process.env.HANDOFF_ANNOUNCE_FALLBACK_MS || '8000', 10);
@@ -1347,6 +1347,16 @@ exports.handleMediaStream = async (twilioWs, req) => {
           console.log('[barge-in] speech_started');
           speechStartedAt = new Date();
 
+          // ✅ closing phrase再生中（terminating context）はバージインを無効化
+          // 挨拶の途中で切れるのを防ぐ
+          const hasTerminatingContext = [...playback.contexts.values()].some(
+            ctx => ctx.terminating && !ctx.invalidated
+          );
+          if (hasTerminatingContext) {
+            console.log('[barge-in] closing phrase in progress — ignoring speech_started');
+            return;
+          }
+
           const shouldInterrupt =
             playback.isAiResponseActive() ||
             !!cartesiaContextId;
@@ -1503,7 +1513,18 @@ exports.handleMediaStream = async (twilioWs, req) => {
               console.log('[SilenceDetection] Cleared previous timer');
             }
 
-            let timeoutDuration = 30000;
+            // ✅ 段階的沈黙検知タイマー
+            // 第1回：5秒（接続直後の無言対応）
+            // 第2回：10秒（再確認）
+            // 第3回：15秒（終話）
+            let timeoutDuration;
+            if (customerSilenceCheckCount === 0) {
+              timeoutDuration = 5000;  // 5秒：最初の確認
+            } else if (customerSilenceCheckCount === 1) {
+              timeoutDuration = 5000;  // 5秒：2回目の確認
+            } else {
+              timeoutDuration = 5000;  // 5秒：通話終了
+            }
 
             console.log(`[SilenceDetection] Starting timer (check ${customerSilenceCheckCount + 1}, ${timeoutDuration}ms) after AI response completion`);
 
@@ -1522,7 +1543,7 @@ exports.handleMediaStream = async (twilioWs, req) => {
                       role: 'user',
                       content: [{
                         type: 'input_text',
-                        text: '[システムメッセージ] 顧客が30秒間応答していません。「もしもし、おつながりでしょうか？」と確認してください。'
+                        text: '[システムメッセージ] 顧客が5秒間応答していません。「もしもし、おつながりでしょうか？」と確認してください。'
                       }]
                     }
                   };
