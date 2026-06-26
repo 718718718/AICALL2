@@ -1348,6 +1348,8 @@ exports.handleMediaStream = async (twilioWs, req) => {
         if (response.type === 'input_audio_buffer.speech_started') {
           console.log('[barge-in] speech_started');
           speechStartedAt = new Date();
+          // ✅ 顧客が話し始めた瞬間にフラグをセット（transcription完了を待たない）
+          customerHasSpoken = true;
 
           // ✅ closing phrase再生中（terminating context）はバージインを無効化
           // 挨拶の途中で切れるのを防ぐ
