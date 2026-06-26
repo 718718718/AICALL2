@@ -942,6 +942,8 @@ exports.handleMediaStream = async (twilioWs, req) => {
 
   // ── フィラー制御用：直前に顧客が話したかどうかのフラグ ──
   let customerJustSpoke = false;
+  // ── 顧客が一度でも話したかどうかのフラグ（沈黙検知タイマー制御用）──
+  let customerHasSpoken = false;
 
   function completeHandoff(reason) {
     if (handoffCompleted) return;
@@ -1438,6 +1440,7 @@ exports.handleMediaStream = async (twilioWs, req) => {
           if (transcript && transcript.length > 0) {
             // ── 顧客が話したフラグをセット ──
             customerJustSpoke = true;
+            customerHasSpoken = true;
 
             callSession.realtimeConversation.push({
               type: 'message',
@@ -1513,17 +1516,28 @@ exports.handleMediaStream = async (twilioWs, req) => {
               console.log('[SilenceDetection] Cleared previous timer');
             }
 
-            // ✅ 段階的沈黙検知タイマー
-            // 第1回：5秒（接続直後の無言対応）
-            // 第2回：10秒（再確認）
-            // 第3回：15秒（終話）
+            // ✅ 顧客が話したことがあるかどうかでタイマーを変える
+            // 初回AI発話後：8秒（相手が反応するのを待つ）
+            // 会話開始後：5秒（会話中の無言検知）
             let timeoutDuration;
-            if (customerSilenceCheckCount === 0) {
-              timeoutDuration = 5000;  // 5秒：最初の確認
-            } else if (customerSilenceCheckCount === 1) {
-              timeoutDuration = 5000;  // 5秒：2回目の確認
+            if (!customerHasSpoken) {
+              // 顧客がまだ一度も話していない場合
+              if (customerSilenceCheckCount === 0) {
+                timeoutDuration = 8000;  // 8秒：最初の反応待ち
+              } else if (customerSilenceCheckCount === 1) {
+                timeoutDuration = 5000;  // 5秒：2回目の確認
+              } else {
+                timeoutDuration = 5000;  // 5秒：通話終了
+              }
             } else {
-              timeoutDuration = 5000;  // 5秒：通話終了
+              // 顧客が一度でも話した後
+              if (customerSilenceCheckCount === 0) {
+                timeoutDuration = 5000;  // 5秒：通常の無言検知
+              } else if (customerSilenceCheckCount === 1) {
+                timeoutDuration = 5000;  // 5秒：2回目の確認
+              } else {
+                timeoutDuration = 5000;  // 5秒：通話終了
+              }
             }
 
             console.log(`[SilenceDetection] Starting timer (check ${customerSilenceCheckCount + 1}, ${timeoutDuration}ms) after AI response completion`);
