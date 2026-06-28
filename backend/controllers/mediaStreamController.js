@@ -936,17 +936,13 @@ exports.handleMediaStream = async (twilioWs, req) => {
       clearTimeout(customerSilenceTimer);
     }
 
+    // ✅ customerSilenceCheckCount === 0 = まだ一度も確認していない = AIが名乗った直後
+    //    この場合は顧客が既に話していても8秒待つ（キャッチボールの間を確保）
     let timeoutDuration;
-    if (!customerHasSpoken) {
-      if (customerSilenceCheckCount === 0) {
-        timeoutDuration = 8000;  // 8秒：最初の反応待ち（名乗り後）
-      } else if (customerSilenceCheckCount === 1) {
-        timeoutDuration = 5000;  // 5秒：2回目の確認
-      } else {
-        timeoutDuration = 5000;  // 5秒：通話終了
-      }
+    if (customerSilenceCheckCount === 0) {
+      timeoutDuration = 8000;  // 8秒：AI発話後、顧客の返答を待つ
     } else {
-      timeoutDuration = 5000;  // 顧客が一度でも話した後は常に5秒
+      timeoutDuration = 5000;  // 5秒：確認フェーズ（もしもし後）
     }
 
     console.log(`[SilenceDetection] Cartesia drain完了(ctx=${drainedCtxId}) → customerHasSpoken=${customerHasSpoken}, タイマー開始 (check ${customerSilenceCheckCount + 1}, ${timeoutDuration}ms)`);
