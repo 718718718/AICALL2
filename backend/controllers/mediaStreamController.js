@@ -36,7 +36,7 @@ function nextClosingCtxId(tag) {
   return `closing-${tag}-${Date.now()}-${closingCounter}`;
 }
 
-function handleDeterministicCallEnd({ endType, phrase, item, openaiWs, cartesiaWs, playback, executor }) {
+function handleDeterministicCallEnd({ endType, phrase, item, openaiWs, cartesiaWs, playback, executor, voiceId = null, onTranscript = null }) {
   let args = {};
   try {
     args = JSON.parse(item.arguments || '{}');
@@ -76,8 +76,14 @@ function handleDeterministicCallEnd({ endType, phrase, item, openaiWs, cartesiaW
   const ctxId = nextClosingCtxId(endType);
   playback.startContext(ctxId);
 
-  sendToCartesia(cartesiaWs, phrase, ctxId, true);
+  // ✅ voiceId を渡す（渡さないとデフォルト女性声になる）
+  sendToCartesia(cartesiaWs, phrase, ctxId, true, voiceId);
   sendToCartesia(cartesiaWs, '', ctxId, false);
+
+  // ✅ closing phraseをフロントエンドの会話内容に表示
+  if (onTranscript) {
+    try { onTranscript(phrase); } catch (e) {}
+  }
 
   playback.scheduleHangupOnDrain(ctxId, () => {
     console.log('[AutoCallEnd] ' + endType + ' audio drained — executing hangup');
@@ -88,7 +94,7 @@ function handleDeterministicCallEnd({ endType, phrase, item, openaiWs, cartesiaW
   return ctxId;
 }
 
-async function executeHandoffWithFallback(callSession, handoffData, twilioWs, getStreamSid, cartesiaWs, playback) {
+async function executeHandoffWithFallback(callSession, handoffData, twilioWs, getStreamSid, cartesiaWs, playback, voiceId = null, onTranscript = null) {
   let result;
   try {
     result = await executeAutoHandoff(callSession, handoffData.callId, handoffData.args);
@@ -103,7 +109,8 @@ async function executeHandoffWithFallback(callSession, handoffData, twilioWs, ge
   const ctxId = nextClosingCtxId('handoff-fallback');
   playback.startContext(ctxId);
   if (CLOSING_PHRASES.handoff_fallback) {
-    sendToCartesia(cartesiaWs, CLOSING_PHRASES.handoff_fallback, ctxId, true);
+    sendToCartesia(cartesiaWs, CLOSING_PHRASES.handoff_fallback, ctxId, true, voiceId);
+    if (onTranscript) { try { onTranscript(CLOSING_PHRASES.handoff_fallback); } catch (e) {} }
   }
   sendToCartesia(cartesiaWs, '', ctxId, false);
   playback.scheduleHangupOnDrain(ctxId, () => {
@@ -1730,7 +1737,9 @@ exports.handleMediaStream = async (twilioWs, req) => {
               openaiWs,
               cartesiaWs,
               playback,
-              executor: (callId, args) => executeAutoCallEnd(callSession, callId, args)
+              executor: (callId, args) => executeAutoCallEnd(callSession, callId, args),
+              voiceId: cartesiaVoiceId,
+              onTranscript: (text) => sendConversationUpdate(callSession, 'assistant', text)
             });
           }
 
@@ -1744,7 +1753,9 @@ exports.handleMediaStream = async (twilioWs, req) => {
               cartesiaWs,
               playback,
               executor: (callId, args) =>
-                executeAutoCallEndOnNoResponse(callSession, callId, args, 'voicemail')
+                executeAutoCallEndOnNoResponse(callSession, callId, args, 'voicemail'),
+              voiceId: cartesiaVoiceId,
+              onTranscript: (text) => sendConversationUpdate(callSession, 'assistant', text)
             });
           }
 
@@ -1758,7 +1769,9 @@ exports.handleMediaStream = async (twilioWs, req) => {
               cartesiaWs,
               playback,
               executor: (callId, args) =>
-                executeAutoCallEndOnNoResponse(callSession, callId, args, 'no_response')
+                executeAutoCallEndOnNoResponse(callSession, callId, args, 'no_response'),
+              voiceId: cartesiaVoiceId,
+              onTranscript: (text) => sendConversationUpdate(callSession, 'assistant', text)
             });
           }
 
@@ -1772,7 +1785,9 @@ exports.handleMediaStream = async (twilioWs, req) => {
               cartesiaWs,
               playback,
               executor: (callId, args) =>
-                executeAutoCallEndOnAbsent(callSession, callId, args)
+                executeAutoCallEndOnAbsent(callSession, callId, args),
+              voiceId: cartesiaVoiceId,
+              onTranscript: (text) => sendConversationUpdate(callSession, 'assistant', text)
             });
           }
         }
