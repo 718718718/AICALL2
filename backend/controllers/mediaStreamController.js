@@ -643,7 +643,7 @@ exports.parseChunkMark = parseChunkMark;
 exports.sendChunkMark = sendChunkMark;
 exports.createCartesiaContextId = createCartesiaContextId;
 
-function createPlaybackTracker({ tailMs = CARTESIA_TAIL_MS, drainTimeoutMs = CARTESIA_DRAIN_TIMEOUT_MS, logger = console } = {}) {
+function createPlaybackTracker({ tailMs = CARTESIA_TAIL_MS, drainTimeoutMs = CARTESIA_DRAIN_TIMEOUT_MS, logger = console, onDrain = null } = {}) {
   const contexts = new Map();
   const markQueue = [];
   let activeContextId = null;
@@ -746,6 +746,10 @@ function createPlaybackTracker({ tailMs = CARTESIA_TAIL_MS, drainTimeoutMs = CAR
       if (activeContextId === id) {
         aiResponseActive = false;
         activeContextId = null;
+      }
+      // ✅ Cartesia音声再生が完全に終わったタイミングでコールバック発火
+      if (!ctx.invalidated && !ctx.terminating && onDrain) {
+        try { onDrain(id); } catch (e) { logger.error('[Playback] onDrain error:', e?.message || e); }
       }
       firePendingHangup(id);
     }
@@ -925,7 +929,93 @@ exports.handleMediaStream = async (twilioWs, req) => {
   let cartesiaContextId = null;
   let textDeltaEventType = null;
 
-  const playback = createPlaybackTracker();
+  // ✅ Cartesia音声再生完了後に沈黙タイマーを開始するコールバック
+  function startSilenceTimerAfterDrain(drainedCtxId) {
+    if (pendingHandoff || pendingCallEnd) return;
+    if (customerSilenceTimer) {
+      clearTimeout(customerSilenceTimer);
+    }
+
+    let timeoutDuration;
+    if (!customerHasSpoken) {
+      if (customerSilenceCheckCount === 0) {
+        timeoutDuration = 8000;  // 8秒：最初の反応待ち（名乗り後）
+      } else if (customerSilenceCheckCount === 1) {
+        timeoutDuration = 5000;  // 5秒：2回目の確認
+      } else {
+        timeoutDuration = 5000;  // 5秒：通話終了
+      }
+    } else {
+      timeoutDuration = 5000;  // 顧客が一度でも話した後は常に5秒
+    }
+
+    console.log(`[SilenceDetection] Cartesia drain完了(ctx=${drainedCtxId}) → customerHasSpoken=${customerHasSpoken}, タイマー開始 (check ${customerSilenceCheckCount + 1}, ${timeoutDuration}ms)`);
+
+    customerSilenceTimer = setTimeout(() => {
+      console.log(`[SilenceDetection] ${timeoutDuration / 1000}秒の沈黙を検知`);
+
+      if (customerSilenceCheckCount === 0) {
+        console.log('[SilenceDetection] Sending first check message');
+        customerSilenceCheckCount = 1;
+
+        if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+          const systemMessage = {
+            type: 'conversation.item.create',
+            item: {
+              type: 'message',
+              role: 'user',
+              content: [{
+                type: 'input_text',
+                text: '[システムメッセージ] 顧客が応答していません。「もしもし、おつながりでしょうか？」と確認してください。'
+              }]
+            }
+          };
+          openaiWs.send(JSON.stringify(systemMessage));
+          openaiWs.send(JSON.stringify({ type: 'response.create' }));
+        }
+      } else if (customerSilenceCheckCount === 1) {
+        console.log('[SilenceDetection] Sending second check message');
+        customerSilenceCheckCount = 2;
+
+        if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+          const systemMessage = {
+            type: 'conversation.item.create',
+            item: {
+              type: 'message',
+              role: 'user',
+              content: [{
+                type: 'input_text',
+                text: '[システムメッセージ] 顧客がまだ応答していません。「恐れ入りますが、お電話つながっておりますでしょうか？」と確認してください。'
+              }]
+            }
+          };
+          openaiWs.send(JSON.stringify(systemMessage));
+          openaiWs.send(JSON.stringify({ type: 'response.create' }));
+        }
+      } else {
+        console.log('[SilenceDetection] Sending final termination message');
+        customerSilenceCheckCount = 0;
+
+        if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+          const systemMessage = {
+            type: 'conversation.item.create',
+            item: {
+              type: 'message',
+              role: 'user',
+              content: [{
+                type: 'input_text',
+                text: '[システムメッセージ] 顧客が応答しません。「お電話が遠いようですので、改めてご連絡させていただきます。失礼いたします」と言って end_call_on_no_response 関数を呼び出して通話を終了してください。'
+              }]
+            }
+          };
+          openaiWs.send(JSON.stringify(systemMessage));
+          openaiWs.send(JSON.stringify({ type: 'response.create' }));
+        }
+      }
+    }, timeoutDuration);
+  }
+
+  const playback = createPlaybackTracker({ onDrain: startSilenceTimerAfterDrain });
   const markQueue = playback.markQueue;
 
   let pendingHandoff = null;
@@ -1521,100 +1611,14 @@ exports.handleMediaStream = async (twilioWs, req) => {
             console.log('[Conversation] Saved to database, total items:', callSession.realtimeConversation.length);
           }
 
+          // ✅ 沈黙タイマーはCartesia再生完了後(onDrain)に開始するため、
+          //    response.done時点では前のタイマーをクリアするだけ
           if (!pendingHandoff && !pendingCallEnd) {
             if (customerSilenceTimer) {
               clearTimeout(customerSilenceTimer);
-              console.log('[SilenceDetection] Cleared previous timer');
+              customerSilenceTimer = null;
+              console.log('[SilenceDetection] response.done: 前のタイマーをクリア（Cartesia drain後に再スタート）');
             }
-
-            // ✅ 顧客が話したことがあるかどうかでタイマーを変える
-            // 初回AI発話後：8秒（相手が反応するのを待つ）
-            // 会話開始後：5秒（会話中の無言検知）
-            let timeoutDuration;
-            if (!customerHasSpoken) {
-              // 顧客がまだ一度も話していない場合
-              if (customerSilenceCheckCount === 0) {
-                timeoutDuration = 8000;  // 8秒：最初の反応待ち
-              } else if (customerSilenceCheckCount === 1) {
-                timeoutDuration = 5000;  // 5秒：2回目の確認
-              } else {
-                timeoutDuration = 5000;  // 5秒：通話終了
-              }
-            } else {
-              // 顧客が一度でも話した後
-              if (customerSilenceCheckCount === 0) {
-                timeoutDuration = 5000;  // 5秒：通常の無言検知
-              } else if (customerSilenceCheckCount === 1) {
-                timeoutDuration = 5000;  // 5秒：2回目の確認
-              } else {
-                timeoutDuration = 5000;  // 5秒：通話終了
-              }
-            }
-
-            console.log(`[SilenceDetection] customerHasSpoken=${customerHasSpoken}, Starting timer (check ${customerSilenceCheckCount + 1}, ${timeoutDuration}ms) after AI response completion`);
-
-            customerSilenceTimer = setTimeout(() => {
-              console.log(`[SilenceDetection] ${timeoutDuration / 1000} seconds of silence detected`);
-
-              if (customerSilenceCheckCount === 0) {
-                console.log('[SilenceDetection] Sending first check message');
-                customerSilenceCheckCount = 1;
-
-                if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
-                  const systemMessage = {
-                    type: 'conversation.item.create',
-                    item: {
-                      type: 'message',
-                      role: 'user',
-                      content: [{
-                        type: 'input_text',
-                        text: '[システムメッセージ] 顧客が5秒間応答していません。「もしもし、おつながりでしょうか？」と確認してください。'
-                      }]
-                    }
-                  };
-                  openaiWs.send(JSON.stringify(systemMessage));
-                  openaiWs.send(JSON.stringify({ type: 'response.create' }));
-                }
-              } else if (customerSilenceCheckCount === 1) {
-                console.log('[SilenceDetection] Sending second check message');
-                customerSilenceCheckCount = 2;
-
-                if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
-                  const systemMessage = {
-                    type: 'conversation.item.create',
-                    item: {
-                      type: 'message',
-                      role: 'user',
-                      content: [{
-                        type: 'input_text',
-                        text: '[システムメッセージ] 顧客がまだ応答していません。「恐れ入りますが、お電話つながっておりますでしょうか？」と確認してください。'
-                      }]
-                    }
-                  };
-                  openaiWs.send(JSON.stringify(systemMessage));
-                  openaiWs.send(JSON.stringify({ type: 'response.create' }));
-                }
-              } else {
-                console.log('[SilenceDetection] Sending final termination message');
-                customerSilenceCheckCount = 0;
-
-                if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
-                  const systemMessage = {
-                    type: 'conversation.item.create',
-                    item: {
-                      type: 'message',
-                      role: 'user',
-                      content: [{
-                        type: 'input_text',
-                        text: '[システムメッセージ] 顧客が応答しません。「お電話が遠いようですので、改めてご連絡させていただきます。失礼いたします」と言って end_call_on_no_response 関数を呼び出して通話を終了してください。'
-                      }]
-                    }
-                  };
-                  openaiWs.send(JSON.stringify(systemMessage));
-                  openaiWs.send(JSON.stringify({ type: 'response.create' }));
-                }
-              }
-            }, timeoutDuration);
           }
 
           if (pendingHandoff) {
