@@ -451,7 +451,7 @@ async function initializeSession(openaiWs, agentSettings) {
           noise_reduction: { type: "near_field" },
           turn_detection: {
             type: "server_vad",
-            threshold: 0.4,
+            threshold: 0.2,
             prefix_padding_ms: 200,
             silence_duration_ms: 400
           },
@@ -596,6 +596,8 @@ function createCartesiaWs(twilioWs, getStreamSid, callbacks = {}) {
     console.error('[Cartesia] CARTESIA_API_KEY is not set');
     return null;
   }
+  // ✅ 新しい接続を作る前に古い接続が残っていないか確認
+  console.log('[Cartesia] Creating new WebSocket connection');
   const url = `wss://api.cartesia.ai/tts/websocket?cartesia_version=${CARTESIA_API_VERSION}`;
   const ws = new WebSocket(url, {
     headers: { 'X-API-Key': process.env.CARTESIA_API_KEY }
@@ -1124,6 +1126,13 @@ exports.handleMediaStream = async (twilioWs, req) => {
 
       await initializeSession(openaiWs, agentSettings);
 
+      // ✅ 古いCartesia接続が残っていればクローズ
+      if (cartesiaWs && cartesiaWs.readyState === WebSocket.OPEN) {
+        console.log('[Cartesia] Closing stale connection before creating new one');
+        cartesiaWs.close();
+        cartesiaWs = null;
+      }
+
       cartesiaWs = createCartesiaWs(twilioWs, () => streamSid, {
         onChunk: ({ ctxId, payload }) => {
           const sid = streamSid;
@@ -1542,7 +1551,7 @@ exports.handleMediaStream = async (twilioWs, req) => {
               }
             }
 
-            console.log(`[SilenceDetection] Starting timer (check ${customerSilenceCheckCount + 1}, ${timeoutDuration}ms) after AI response completion`);
+            console.log(`[SilenceDetection] customerHasSpoken=${customerHasSpoken}, Starting timer (check ${customerSilenceCheckCount + 1}, ${timeoutDuration}ms) after AI response completion`);
 
             customerSilenceTimer = setTimeout(() => {
               console.log(`[SilenceDetection] ${timeoutDuration / 1000} seconds of silence detected`);
