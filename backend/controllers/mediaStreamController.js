@@ -458,9 +458,9 @@ async function initializeSession(openaiWs, agentSettings) {
           noise_reduction: { type: "near_field" },
           turn_detection: {
             type: "server_vad",
-            threshold: 0.2,
-            prefix_padding_ms: 200,
-            silence_duration_ms: 400
+            threshold: 0.4,        // 0.2は低すぎてエコー・ノイズで誤発火する
+            prefix_padding_ms: 300,
+            silence_duration_ms: 600  // 短すぎると発話途中で切れる
           },
           transcription: {
             model: "gpt-4o-transcribe",
@@ -931,6 +931,8 @@ exports.handleMediaStream = async (twilioWs, req) => {
   let responseStartTimestamp = null;
   let openaiWs = null;
   let cartesiaWs = null;
+  let cartesiaVoiceId = CARTESIA_VOICE_ID_DEFAULT; // ✅ スコープを外に出す（completeHandoffから参照するため）
+  let cartesiaSpeed = null;
   let textBuffer = '';
   let currentResponseId = null;
   let cartesiaContextId = null;
@@ -1057,7 +1059,7 @@ exports.handleMediaStream = async (twilioWs, req) => {
     if (!handoffData) return;
 
     console.log('[AutoHandoff] completing handoff reason=' + reason);
-    executeHandoffWithFallback(callSession, handoffData, twilioWs, () => streamSid, cartesiaWs, playback)
+    executeHandoffWithFallback(callSession, handoffData, twilioWs, () => streamSid, cartesiaWs, playback, cartesiaVoiceId, (text) => sendConversationUpdate(callSession, 'assistant', text))
       .catch(err => console.error('[AutoHandoff] Error execution:', err));
   }
 
@@ -1201,9 +1203,9 @@ exports.handleMediaStream = async (twilioWs, req) => {
     }
 
     const temperature = agentSettings?.temperature || 0.8;
-    const cartesiaVoiceId = agentSettings?.cartesiaVoiceId || CARTESIA_VOICE_ID_DEFAULT;
+    cartesiaVoiceId = agentSettings?.cartesiaVoiceId || CARTESIA_VOICE_ID_DEFAULT;
     const speechRateMap = { slow: 0.8, normal: 1.0, fast: 1.2 };
-    const cartesiaSpeed = speechRateMap[agentSettings?.conversationSettings?.speechRate] || null;
+    cartesiaSpeed = speechRateMap[agentSettings?.conversationSettings?.speechRate] || null;
     const openaiUrl = `wss://api.openai.com/v1/realtime?model=gpt-realtime&temperature=${temperature}`;
     console.log('[OpenAI] Connecting to:', openaiUrl);
     console.log('[OpenAI] API Key present:', !!process.env.OPENAI_REALTIME_API_KEY);
@@ -1439,7 +1441,7 @@ exports.handleMediaStream = async (twilioWs, req) => {
                            response.type === 'response.output_text.done';
         if (isTextDone && cartesiaContextId) {
           if (textBuffer.trim()) {
-            sendToCartesia(cartesiaWs, textBuffer, cartesiaContextId, true);
+            sendToCartesia(cartesiaWs, textBuffer, cartesiaContextId, true, cartesiaVoiceId, cartesiaSpeed);
             textBuffer = '';
           }
           sendToCartesia(cartesiaWs, '', cartesiaContextId, false);
