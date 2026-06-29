@@ -1443,6 +1443,12 @@ exports.handleMediaStream = async (twilioWs, req) => {
         const isTextDone = response.type === 'response.text.done' ||
                            response.type === 'response.output_text.done';
         if (isTextDone && cartesiaContextId) {
+          // ✅ function callによるclosing phraseが既にセットされている場合はテキスト応答を無視
+          if (pendingCallEnd || pendingHandoff) {
+            console.log('[TextDone] skipping — pendingCallEnd/Handoff already set, dropping duplicate speech');
+            textBuffer = '';
+            cartesiaContextId = null;
+          } else {
           if (textBuffer.trim()) {
             sendToCartesia(cartesiaWs, textBuffer, cartesiaContextId, true, cartesiaVoiceId, cartesiaSpeed);
             textBuffer = '';
@@ -1450,6 +1456,7 @@ exports.handleMediaStream = async (twilioWs, req) => {
           sendToCartesia(cartesiaWs, '', cartesiaContextId, false);
           lastCompletedCtxId = cartesiaContextId;
           cartesiaContextId = null;
+          } // end else (not pendingCallEnd/Handoff)
         }
 
         if (response.type === 'input_audio_buffer.speech_started') {
