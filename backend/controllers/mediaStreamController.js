@@ -934,6 +934,9 @@ exports.handleMediaStream = async (twilioWs, req) => {
   let cartesiaVoiceId = CARTESIA_VOICE_ID_DEFAULT; // ✅ スコープを外に出す（completeHandoffから参照するため）
   let cartesiaSpeed = null;
   let textBuffer = '';
+  let pendingBargeIn = false;         // ✅ 仮バージイン中フラグ（transcription確認待ち）
+  let bargeInSavedText = '';          // バージイン時に中断したAIのテキスト
+  let bargeInSavedCtxId = null;       // バージイン時のcontextId
   let currentResponseId = null;
   let cartesiaContextId = null;
   let textDeltaEventType = null;
@@ -1482,10 +1485,15 @@ exports.handleMediaStream = async (twilioWs, req) => {
             return;
           }
 
+          // ✅ 仮バージイン：AIを止めるがtranscription確認まで「ノイズかも」として保留
+          pendingBargeIn = true;
+          bargeInSavedText = textBuffer;
+          bargeInSavedCtxId = cartesiaContextId;
+
           if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
             try {
               openaiWs.send(JSON.stringify({ type: 'response.cancel' }));
-              console.log('[barge-in] openai response.cancel sent');
+              console.log('[barge-in] openai response.cancel sent (pending confirmation)');
             } catch (e) {
               console.error('[barge-in] openai response.cancel error:', e.message);
             }
@@ -1499,7 +1507,7 @@ exports.handleMediaStream = async (twilioWs, req) => {
             }
           }
           playback.invalidateAll('speech_started');
-          console.log('[barge-in] cartesia context invalidated');
+          console.log('[barge-in] cartesia context invalidated (pending noise check)');
 
           if (twilioWs && twilioWs.readyState === WebSocket.OPEN && streamSid) {
             try {
@@ -1542,6 +1550,38 @@ exports.handleMediaStream = async (twilioWs, req) => {
           const itemId = response.item_id;
 
           console.log('[User Transcription] Completed:', { itemId, transcript });
+
+          // ✅ ノイズ判定：transcriptが空または1文字以下 → バージインを取り消してAI発話を再開
+          const isNoise = !transcript || transcript.trim().length <= 1;
+          if (pendingBargeIn && isNoise) {
+            console.log('[barge-in] noise detected (transcript empty/too short), resuming AI speech');
+            pendingBargeIn = false;
+
+            // AI発話を再開：中断したテキストから続きを送信
+            if (bargeInSavedText && bargeInSavedText.trim()) {
+              const resumeCtxId = createCartesiaContextId('resume', Date.now().toString());
+              playback.startContext(resumeCtxId);
+              cartesiaContextId = resumeCtxId;
+              sendToCartesia(cartesiaWs, bargeInSavedText, resumeCtxId, false, cartesiaVoiceId, cartesiaSpeed);
+              console.log('[barge-in] resumed AI speech from saved buffer');
+            } else {
+              // テキストバッファが空（AIの発話が終わっていた）→ 沈黙タイマーを再スタート
+              if (!pendingHandoff && !pendingCallEnd) {
+                if (customerSilenceTimer) clearTimeout(customerSilenceTimer);
+                customerSilenceCheckCount = 0;
+                // onDrainで自動的にタイマーが始まるので何もしなくてよい
+              }
+            }
+            bargeInSavedText = '';
+            bargeInSavedCtxId = null;
+            speechStartedAt = null;
+            return; // ここで終了（以降の処理をスキップ）
+          }
+
+          // 本物の発話 → 仮バージインを確定
+          pendingBargeIn = false;
+          bargeInSavedText = '';
+          bargeInSavedCtxId = null;
 
           if (transcript && transcript.length > 0) {
             // ── 顧客が話したフラグをセット ──
