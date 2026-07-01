@@ -48,6 +48,17 @@ router.post('/voice/handoff-failed/:callId', handleHandoffFailedTwiML);
 router.post('/conference/events/:callId', handleConferenceEvents);
 router.post('/call/status/:callId', handleCallStatus);
 router.post('/recording/status/:callId', handleRecordingStatus);
+
+// 録音ファイルプロキシ（Twilio認証付きでMP3をストリーム）
+router.get('/recordings/:recordingSid', require('../middlewares/authMiddleware').protect, async (req, res) => {
+  try {
+    const recordingService = require('../services/recordingService');
+    await recordingService.streamRecording(req.params.recordingSid, res);
+  } catch (error) {
+    console.error('[Recording Proxy] Error:', error);
+    res.status(500).json({ error: 'Failed to fetch recording' });
+  }
+});
 router.post('/transfer/status/:callId', handleTransferStatus);
 router.post('/handoff-status/:callId', handleHandoffStatus);
 
