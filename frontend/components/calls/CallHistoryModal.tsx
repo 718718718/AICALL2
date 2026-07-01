@@ -9,33 +9,21 @@ import {
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { X, Phone, Volume2, Mic } from "lucide-react";
+import { X, Phone, Volume2, Mic, Download } from "lucide-react";
 
-interface CallHistoryModalProps {
-  isOpen: boolean;
-  onClose: () => void;
-  callSession: any;
-}
-
-interface TranscriptEntry {
-  speaker: "AI" | "Customer" | "System";
-  text: string;
-  timestamp: string;
-}
-
-export function CallHistoryModal({
-  isOpen,
-  onClose,
-  callSession,
-}: CallHistoryModalProps) {
-  const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
-  const scrollRef = useRef<HTMLDivElement>(null);
+export function CallHistoryModal({ isOpen, onClose, callSession }) {
+  const [transcript, setTranscript] = useState([]);
+  const scrollRef = useRef(null);
 
   useEffect(() => {
     if (isOpen && callSession) {
-      // CallSessionのトランスクリプトを変換
-      const convertedTranscript: TranscriptEntry[] = callSession.transcript?.map((entry: any) => ({
-        speaker: entry.speaker === "ai" ? "AI" : entry.speaker === "customer" ? "Customer" : "System",
+      const convertedTranscript = callSession.transcript?.map((entry) => ({
+        speaker:
+          entry.speaker === "ai"
+            ? "AI"
+            : entry.speaker === "customer"
+            ? "Customer"
+            : "System",
         text: entry.message || "",
         timestamp: new Date(entry.timestamp).toLocaleTimeString("ja-JP"),
       })) || [];
@@ -45,16 +33,15 @@ export function CallHistoryModal({
   }, [isOpen, callSession]);
 
   useEffect(() => {
-    // Auto-scroll to bottom when modal opens
     if (scrollRef.current && isOpen) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
   }, [transcript, isOpen]);
 
-  const formatDuration = (seconds: number) => {
+  const formatDuration = (seconds) => {
     const minutes = Math.floor(seconds / 60);
     const remainingSeconds = seconds % 60;
-    return `${minutes}:${remainingSeconds.toString().padStart(2, '0')}`;
+    return `${minutes}:${remainingSeconds.toString().padStart(2, "0")}`;
   };
 
   const getStatusColor = () => {
@@ -95,7 +82,9 @@ export function CallHistoryModal({
               通話履歴詳細
             </div>
             <div className="flex items-center gap-2">
-              <span className={`px-3 py-1 rounded-full text-white text-sm ${getStatusColor()}`}>
+              <span
+                className={`px-3 py-1 rounded-full text-white text-sm ${getStatusColor()}`}
+              >
                 {getStatusText()}
               </span>
               <Button
@@ -120,27 +109,49 @@ export function CallHistoryModal({
               </div>
               <div>
                 <span className="font-semibold">通話時間:</span>{" "}
-                {callSession.duration ? formatDuration(callSession.duration) : "不明"}
+                {callSession.duration
+                  ? formatDuration(callSession.duration)
+                  : "不明"}
               </div>
               <div>
                 <span className="font-semibold">結果:</span>{" "}
-                <span className={`px-2 py-1 rounded text-xs ${
-                  callSession.callResult === "成功" ? "bg-green-100 text-green-800" :
-                  callSession.callResult === "拒否" ? "bg-red-100 text-red-800" :
-                  callSession.callResult === "不在" ? "bg-yellow-100 text-yellow-800" :
-                  "bg-gray-100 text-gray-800"
-                }`}>
+                <span
+                  className={`px-2 py-1 rounded text-xs ${
+                    callSession.callResult === "成功"
+                      ? "bg-green-100 text-green-800"
+                      : callSession.callResult === "拒否"
+                      ? "bg-red-100 text-red-800"
+                      : callSession.callResult === "不在"
+                      ? "bg-yellow-100 text-yellow-800"
+                      : "bg-gray-100 text-gray-800"
+                  }`}
+                >
                   {callSession.callResult || "未設定"}
                 </span>
               </div>
               <div>
                 <span className="font-semibold">電話番号:</span>{" "}
-                <span className="text-blue-600 font-mono">{callSession.phoneNumber}</span>
+                <span className="text-blue-600 font-mono">
+                  {callSession.phoneNumber}
+                </span>
               </div>
             </div>
             {callSession.notes && (
               <div className="mt-2">
                 <span className="font-semibold">メモ:</span> {callSession.notes}
+              </div>
+            )}
+            {/* 録音ダウンロード */}
+            {callSession.recordingUrl && (
+              <div className="mt-2">
+                <a
+                  href={`${process.env.NEXT_PUBLIC_API_URL || ""}${callSession.recordingUrl}`}
+                  download={`recording_${callSession._id}.mp3`}
+                  className="inline-flex items-center gap-1 px-3 py-1 text-sm text-blue-600 border border-blue-300 rounded hover:bg-blue-50"
+                >
+                  <Download className="h-3 w-3" />
+                  録音をダウンロード
+                </a>
               </div>
             )}
           </div>
@@ -161,8 +172,11 @@ export function CallHistoryModal({
                     <div
                       key={index}
                       className={`flex ${
-                        entry.speaker === "System" ? "justify-center" :
-                        entry.speaker === "AI" ? "justify-start" : "justify-end"
+                        entry.speaker === "System"
+                          ? "justify-center"
+                          : entry.speaker === "AI"
+                          ? "justify-start"
+                          : "justify-end"
                       }`}
                     >
                       {entry.speaker === "System" ? (
@@ -171,20 +185,28 @@ export function CallHistoryModal({
                             <Phone className="h-3 w-3" />
                             <span>{entry.timestamp}</span>
                           </div>
-                          <p className="mt-1 text-sm text-gray-600">{entry.text}</p>
+                          <p className="mt-1 text-sm text-gray-600">
+                            {entry.text}
+                          </p>
                         </div>
                       ) : (
-                        <div className={`max-w-[60%] ${
-                          entry.speaker === "Customer" ? "ml-auto" : "mr-auto"
-                        }`}>
-                          <div className={`flex items-start gap-2 ${
-                            entry.speaker === "Customer" ? "flex-row-reverse" : ""
-                          }`}>
-                            <div className={`flex-shrink-0 w-10 h-10 rounded-full flex items-center justify-center ${
-                              entry.speaker === "AI" 
-                                ? "bg-blue-100" 
-                                : "bg-green-100"
-                            }`}>
+                        <div
+                          className={`max-w-[60%] ${
+                            entry.speaker === "Customer" ? "ml-auto" : "mr-auto"
+                          }`}
+                        >
+                          <div
+                            className={`flex items-start gap-2 ${
+                              entry.speaker === "Customer" ? "flex-row-reverse" : ""
+                            }`}
+                          >
+                            <div
+                              className={`flex-shrink-0 w-10 h-10 rounded-full flex items-center justify-center ${
+                                entry.speaker === "AI"
+                                  ? "bg-blue-100"
+                                  : "bg-green-100"
+                              }`}
+                            >
                               {entry.speaker === "AI" ? (
                                 <Volume2 className="h-5 w-5 text-blue-600" />
                               ) : (
@@ -192,22 +214,34 @@ export function CallHistoryModal({
                               )}
                             </div>
                             <div className="flex-1">
-                              <div className={`flex items-center gap-2 mb-1 ${
-                                entry.speaker === "Customer" ? "justify-end" : ""
-                              }`}>
-                                <span className={`text-xs font-semibold ${
-                                  entry.speaker === "AI" ? "text-blue-600" : "text-green-600"
-                                }`}>
+                              <div
+                                className={`flex items-center gap-2 mb-1 ${
+                                  entry.speaker === "Customer" ? "justify-end" : ""
+                                }`}
+                              >
+                                <span
+                                  className={`text-xs font-semibold ${
+                                    entry.speaker === "AI"
+                                      ? "text-blue-600"
+                                      : "text-green-600"
+                                  }`}
+                                >
                                   {entry.speaker === "AI" ? "AI" : "顧客"}
                                 </span>
-                                <span className="text-xs text-gray-500">{entry.timestamp}</span>
+                                <span className="text-xs text-gray-500">
+                                  {entry.timestamp}
+                                </span>
                               </div>
-                              <div className={`rounded-2xl px-4 py-3 ${
-                                entry.speaker === "AI"
-                                  ? "bg-blue-50 text-blue-900 border border-blue-200"
-                                  : "bg-white text-gray-900 border border-gray-300"
-                              }`}>
-                                <p className="text-sm leading-relaxed">{entry.text}</p>
+                              <div
+                                className={`rounded-2xl px-4 py-3 ${
+                                  entry.speaker === "AI"
+                                    ? "bg-blue-50 text-blue-900 border border-blue-200"
+                                    : "bg-white text-gray-900 border border-gray-300"
+                                }`}
+                              >
+                                <p className="text-sm leading-relaxed">
+                                  {entry.text}
+                                </p>
                               </div>
                             </div>
                           </div>
