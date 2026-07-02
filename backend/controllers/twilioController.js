@@ -1336,32 +1336,24 @@ exports.handleRecordingStatus = asyncHandler(async (req, res) => {
 
   try {
     if (RecordingStatus === 'completed' && RecordingUrl) {
-      console.log('[RecordingStatus] Recording completed, downloading to local storage...');
-      
-      // Download and save recording locally
-      const recordingService = require('../services/recordingService');
-      const localPath = await recordingService.downloadAndSaveRecording(
-        RecordingUrl, 
-        callId, 
-        RecordingSid
-      );
+      console.log('[RecordingStatus] Recording completed, saving Twilio SID...');
 
-      // Generate local URL
-      const baseUrl = process.env.BASE_URL || 'http://localhost:5000';
-      const localUrl = `${baseUrl}/${localPath}`;
+      // ✅ ローカル保存をやめてプロキシURL形式で保存
+      // Renderはエフェメラルストレージのためローカルファイルは消える
+      const recordingPath = `/api/twilio/recordings/${RecordingSid}`;
 
-      // Update CallSession with local URL
+      // Update CallSession with proxy URL
       await CallSession.findByIdAndUpdate(callId, {
-        recordingUrl: localUrl,
+        recordingUrl: recordingPath,
         twilioRecordingUrl: RecordingUrl,
         recordingSid: RecordingSid
       });
 
-      console.log('[RecordingStatus] Recording saved locally:', localUrl);
+      console.log('[RecordingStatus] Recording path saved:', recordingPath);
 
       // WebSocketで通知
       webSocketService.sendToCallRoom(callId, 'recording-available', {
-        recordingUrl: localUrl,
+        recordingUrl: recordingPath,
         recordingSid: RecordingSid
       });
     }
