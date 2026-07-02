@@ -20,7 +20,7 @@ const {
   handleHandoffStatus,
   handleHandoffFailedTwiML
 } = require('../controllers/twilioController');
-const { handleIncomingCall } = require('../controllers/twilioVoiceController');
+// handleIncomingCall は未使用のため削除
 const { handleHandoffRedirect } = require('../controllers/handoffRedirectController');
 // const { handleIncomingCallUltraSimple } = require('../controllers/twilioVoiceController.ultraSimple');
 
@@ -30,7 +30,7 @@ const { handleHandoffRedirect } = require('../controllers/handoffRedirectControl
 // router.get('/incoming-call', handleIncomingCallUltraSimple);
 
 // Main voice endpoint for incoming calls
-router.post('/voice', handleIncomingCall);
+// router.post('/voice', handleIncomingCall); // handleIncomingCall未定義のためコメントアウト
 
 // TwiML generation endpoints
 router.post('/voice/conference/:callId', generateConferenceTwiML);
@@ -48,6 +48,17 @@ router.post('/voice/handoff-failed/:callId', handleHandoffFailedTwiML);
 router.post('/conference/events/:callId', handleConferenceEvents);
 router.post('/call/status/:callId', handleCallStatus);
 router.post('/recording/status/:callId', handleRecordingStatus);
+
+// 録音ファイルプロキシ（Twilio認証付きでMP3をストリーム）
+router.get('/recordings/:recordingSid', async (req, res) => {
+  try {
+    const recordingService = require('../services/recordingService');
+    await recordingService.streamRecording(req.params.recordingSid, res);
+  } catch (error) {
+    console.error('[Recording Proxy] Error:', error);
+    res.status(500).json({ error: 'Failed to fetch recording' });
+  }
+});
 
 // 録音ファイルプロキシ（Twilio認証付きでMP3をストリーム）
 router.get('/recordings/:recordingSid', async (req, res) => {
