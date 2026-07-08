@@ -5,6 +5,24 @@ const { protect } = require('../middlewares/authMiddleware');
 const CallSession = require('../models/CallSession');
 const Customer = require('../models/Customer');
 const config = require('../config/environment');
+const twilio = require('twilio');
+const twilioClient = twilio(config.twilio.accountSid, config.twilio.authToken);
+
+// 通話SIDからTwilio上の録音SIDを取得する（DBに録音情報が保存されていない場合のフォールバック）。
+// 録音完了コールバックの取りこぼし（Renderのスリープ・再デプロイ中など）があっても、
+// これで実際の録音を拾えるようにする。
+async function resolveRecordingSidFromTwilio(callSid) {
+  if (!callSid || callSid === 'pending') return null;
+  try {
+    const recordings = await twilioClient.recordings.list({ callSid, limit: 1 });
+    if (recordings && recordings.length > 0) {
+      return recordings[0].sid;
+    }
+  } catch (err) {
+    console.error('[CallHistory] Twilio録音の照会に失敗:', err.message);
+  }
+  return null;
+}
 
 // 認証必須
 router.use(protect);
@@ -194,6 +212,22 @@ router.get('/:id', async (req, res) => {
     const minutes = Math.floor(duration / 60);
     const seconds = duration % 60;
 
+    // 録音のダウンロード可否を判定。
+    // DBに録音情報が無くても、通話SIDが有り実際に会話があった（duration>0）場合は
+    // Twilioに直接照会し、見つかればrecordingSidをDBへ補完しておく（次回以降は即時判定）。
+    let hasRecording = !!(call.twilioRecordingUrl || call.recordingSid);
+    if (!hasRecording && call.twilioCallSid && duration > 0) {
+      const sid = await resolveRecordingSidFromTwilio(call.twilioCallSid);
+      if (sid) {
+        hasRecording = true;
+        try {
+          await CallSession.updateOne({ _id: call._id }, { recordingSid: sid });
+        } catch (e) {
+          console.error('[CallHistory] recordingSidのbackfillに失敗:', e.message);
+        }
+      }
+    }
+
     const formattedCall = {
       id: call._id,
       customer: call.customerId ? {
@@ -212,8 +246,8 @@ router.get('/:id', async (req, res) => {
       assignedAgent: call.assignedAgent,
       twilioCallSid: call.twilioCallSid,
       recordingUrl: call.recordingUrl,
-      // 録音がダウンロード可能かどうか（twilioRecordingUrlまたはrecordingSidが必要）
-      hasRecording: !!(call.twilioRecordingUrl || call.recordingSid),
+      // 録音がダウンロード可能かどうか（DB保存 or Twilio照会で判定）
+      hasRecording,
       transcript: call.transcript || [],
       handoffDetails: call.handoffDetails,
       aiConfiguration: call.aiConfiguration
@@ -252,15 +286,29 @@ router.get('/:id/recording', async (req, res) => {
 
     // twilioRecordingUrlを優先、なければrecordingSidからURLを構築
     let twilioUrl = call.twilioRecordingUrl;
+    let recordingSid = call.recordingSid;
 
-    if (!twilioUrl && call.recordingSid) {
-      twilioUrl = `https://api.twilio.com/2010-04-01/Accounts/${config.twilio.accountSid}/Recordings/${call.recordingSid}`;
+    // DBに録音情報が無い場合は、通話SIDからTwilioに直接照会する（コールバック取りこぼし対策）
+    if (!twilioUrl && !recordingSid && call.twilioCallSid) {
+      recordingSid = await resolveRecordingSidFromTwilio(call.twilioCallSid);
+      if (recordingSid) {
+        // 見つかったらDBへ補完しておく
+        try {
+          await CallSession.updateOne({ _id: call._id }, { recordingSid });
+        } catch (e) {
+          console.error('[CallHistory] recordingSidのbackfillに失敗:', e.message);
+        }
+      }
+    }
+
+    if (!twilioUrl && recordingSid) {
+      twilioUrl = `https://api.twilio.com/2010-04-01/Accounts/${config.twilio.accountSid}/Recordings/${recordingSid}`;
     }
 
     if (!twilioUrl) {
       return res.status(404).json({
         success: false,
-        error: '録音データが見つかりません'
+        error: '録音データが見つかりません。録音が存在しないか、まだ準備中の可能性があります。少し待ってから再度お試しください。'
       });
     }
 
@@ -278,8 +326,8 @@ router.get('/:id/recording', async (req, res) => {
         'Authorization': `Basic ${authString}`
       }
     }, (twilioResponse) => {
-      // リダイレクトの処理
-      if (twilioResponse.statusCode === 301 || twilioResponse.statusCode === 302) {
+      // リダイレクトの処理（301/302/307/308すべて対応）
+      if ([301, 302, 307, 308].includes(twilioResponse.statusCode)) {
         const redirectUrl = twilioResponse.headers.location;
         console.log('[CallHistory] Following redirect to:', redirectUrl);
 
@@ -287,9 +335,12 @@ router.get('/:id/recording', async (req, res) => {
         https.get(redirectUrl, (redirectResponse) => {
           if (redirectResponse.statusCode !== 200) {
             console.error('[CallHistory] Redirect failed:', redirectResponse.statusCode);
-            return res.status(500).json({
+            const notReady = redirectResponse.statusCode === 404;
+            return res.status(notReady ? 404 : 502).json({
               success: false,
-              error: '録音のダウンロードに失敗しました'
+              error: notReady
+                ? '録音はまだ準備中の可能性があります。少し待ってから再度お試しください。'
+                : '録音のダウンロードに失敗しました'
             });
           }
 
@@ -316,9 +367,12 @@ router.get('/:id/recording', async (req, res) => {
 
       if (twilioResponse.statusCode !== 200) {
         console.error('[CallHistory] Twilio response error:', twilioResponse.statusCode);
-        return res.status(500).json({
+        const notReady = twilioResponse.statusCode === 404;
+        return res.status(notReady ? 404 : 502).json({
           success: false,
-          error: '録音のダウンロードに失敗しました'
+          error: notReady
+            ? '録音はまだ準備中の可能性があります。少し待ってから再度お試しください。'
+            : '録音のダウンロードに失敗しました'
         });
       }
 
