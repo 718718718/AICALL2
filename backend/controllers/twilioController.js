@@ -130,6 +130,31 @@ exports.generateConferenceTwiML = asyncHandler(async (req, res) => {
       return res.type('text/xml').send(twiml.toString());
     }
 
+    // ✅ AMD（応答検知）ゲート
+    // Twilioの機械検知結果。'Enable'モードでは human / machine_start / fax / unknown が入る。
+    // 留守番電話・自動応答（machine_*）や fax の場合はAIを繋がず切断する。
+    // unknown（判定不能）と human は通常どおり接続する（実顧客の取りこぼしを防ぐ安全側）。
+    const answeredBy = req.body.AnsweredBy || req.query.AnsweredBy || '';
+    const isMachine = /^machine/i.test(answeredBy) || answeredBy === 'fax';
+    console.log(`[TwiML Conference] AnsweredBy: ${answeredBy || '(none)'} => ${isMachine ? 'MACHINE (hang up, no AI)' : 'HUMAN/UNKNOWN (connect AI)'}`);
+
+    if (isMachine) {
+      console.log(`[TwiML Conference] 留守番電話/自動応答を検知したためAIを繋がず切断します。callId: ${callId}`);
+      try {
+        callSession.status = 'completed';
+        callSession.callResult = '不在';
+        callSession.endReason = 'normal';
+        callSession.endTime = new Date();
+        callSession.answeredBy = answeredBy; // 記録用（voicemail判定の可視化）
+        await callSession.save();
+      } catch (saveErr) {
+        console.error('[TwiML Conference] AMD切断時のCallSession更新エラー:', saveErr);
+      }
+      // 留守電にはメッセージを残さず、無音のまま即切断する
+      twiml.hangup();
+      return res.type('text/xml').send(twiml.toString());
+    }
+
     // デフォルトの初期メッセージを使用（遅延を避けるため）
     let initialMessage = 'お世話になります。AIコールシステム株式会社です。営業部のご担当者さまはいらっしゃいますでしょうか？';
     
