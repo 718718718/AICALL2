@@ -73,9 +73,19 @@ exports.startCall = asyncHandler(async (req, res, next) => {
     
     // Twilioで通話を開始
     // BYOC設定があれば03番号＋BYOCトランク経由に切り替え（未設定なら従来のfromNumber）
+    // ✅ AMD（応答検知）: 留守番電話・自動応答が出た場合にAIを繋がず切断する
+    const amdEnabled = process.env.ENABLE_AMD !== 'false';
+    const amdParams = amdEnabled
+      ? {
+          machineDetection: 'Enable',
+          machineDetectionTimeout: parseInt(process.env.AMD_TIMEOUT_SEC, 10) || 5
+        }
+      : {};
+
     const call = await client.calls.create({
       to: customer.phone,
       ...getByocCallParams(fromNumber),
+      ...amdParams,
       url: `${process.env.BASE_URL}/api/twilio/voice/conference/${callSession._id}`,
       statusCallback: `${process.env.BASE_URL}/api/twilio/call/status/${callSession._id}`,
       statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
