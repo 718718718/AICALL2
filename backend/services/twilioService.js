@@ -94,9 +94,25 @@ exports.makeCall = async (phoneNumber, sessionId, userId = null) => {
     console.log('[TwilioService] From number:', callParams.from, callParams.byoc ? `(BYOC trunk: ${callParams.byoc})` : '(Twilio PSTN)');
     console.log('[TwilioService] Using webhook URL:', `${baseUrl}/api/twilio/voice/conference/${sessionId}`);
 
+    // ✅ AMD（応答検知 / Answering Machine Detection）
+    // 留守番電話・自動応答が出た場合にAIを繋がず切断するための同期検知。
+    // Twilioが応答直後に人間/機械を判定し、判定結果(AnsweredBy)を
+    // url webhook（generateConferenceTwiML）に渡す。
+    // ENABLE_AMD=false で無効化可能（デフォルト有効）。
+    const amdEnabled = process.env.ENABLE_AMD !== 'false';
+    const amdParams = amdEnabled
+      ? {
+          // 'Enable' = 人間/機械を素早く判定（留守電メッセージ末尾までは待たない）
+          machineDetection: 'Enable',
+          // 判定の最大待ち時間（秒）。この時間内に判定できなければ AnsweredBy=unknown。
+          machineDetectionTimeout: parseInt(process.env.AMD_TIMEOUT_SEC, 10) || 5
+        }
+      : {};
+
     const call = await client.calls.create({
       to: formattedNumber,
       ...callParams,
+      ...amdParams,
       url: `${baseUrl}/api/twilio/voice/conference/${sessionId}`,
       statusCallback: `${baseUrl}/api/twilio/call/status/${sessionId}`,
       statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed', 'failed', 'busy', 'no-answer', 'cancelled'],
@@ -106,6 +122,7 @@ exports.makeCall = async (phoneNumber, sessionId, userId = null) => {
       recordingStatusCallback: `${baseUrl}/api/twilio/recording/status/${sessionId}`,
       recordingStatusCallbackMethod: 'POST'
     });
+    console.log(`[TwilioService] AMD (machine detection): ${amdEnabled ? `enabled (timeout ${amdParams.machineDetectionTimeout}s)` : 'disabled'}`);
 
     console.log(`[TwilioService] Call created successfully:`);
     console.log(`[TwilioService] Call SID: ${call.sid}`);
