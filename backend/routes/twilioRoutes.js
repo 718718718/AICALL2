@@ -59,17 +59,6 @@ router.get('/recordings/:recordingSid', async (req, res) => {
     res.status(500).json({ error: 'Failed to fetch recording' });
   }
 });
-
-// 録音ファイルプロキシ（Twilio認証付きでMP3をストリーム）
-router.get('/recordings/:recordingSid', async (req, res) => {
-  try {
-    const recordingService = require('../services/recordingService');
-    await recordingService.streamRecording(req.params.recordingSid, res);
-  } catch (error) {
-    console.error('[Recording Proxy] Error:', error);
-    res.status(500).json({ error: 'Failed to fetch recording' });
-  }
-});
 router.post('/transfer/status/:callId', handleTransferStatus);
 router.post('/handoff-status/:callId', handleHandoffStatus);
 
