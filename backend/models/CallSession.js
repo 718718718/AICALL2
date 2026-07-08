@@ -132,6 +132,12 @@ const CallSessionSchema = new mongoose.Schema({
       message: 'Invalid callResult value: {VALUE}. Must be one of: ' + VALID_CALL_RESULT.join(', ')
     }
   },
+  // AMD（応答検知）の結果。Twilioの AnsweredBy をそのまま保存（human / machine_start / fax / unknown 等）。
+  // 留守番電話・自動応答で切断されたコールの可視化に使用。
+  answeredBy: {
+    type: String,
+    required: false
+  },
   notes: String,
   duration: Number,
   recordingUrl: String,
