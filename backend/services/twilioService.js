@@ -115,7 +115,7 @@ exports.makeCall = async (phoneNumber, sessionId, userId = null) => {
       ...amdParams,
       url: `${baseUrl}/api/twilio/voice/conference/${sessionId}`,
       statusCallback: `${baseUrl}/api/twilio/call/status/${sessionId}`,
-      statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed', 'failed', 'busy', 'no-answer', 'cancelled'],
+      statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
       statusCallbackMethod: 'POST',
       method: 'POST',
       record: true,
