@@ -139,7 +139,7 @@ exports.executeHandoffLogic = async (callSession, user, handoffMethod = 'manual'
       twiml: agentTwiml,
       timeout: 30,
       statusCallback: `${getPublicBaseUrl()}/api/twilio/handoff-status/${callId}`,
-      statusCallbackEvent: ['no-answer', 'busy', 'failed', 'completed']
+      statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed']
     });
     
     console.log(`[Handoff] Agent call created: ${agentCall.sid}`);
@@ -693,7 +693,7 @@ exports.initiateHandoffByPhone = asyncHandler(async (req, res, next) => {
         twiml: agentTwiml,
         timeout: 30,
         statusCallback: `${getPublicBaseUrl()}/api/twilio/handoff-status/${callId}`,
-        statusCallbackEvent: ['no-answer', 'busy', 'failed', 'completed']
+        statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed']
       }),
       callSession.twilioCallSid && callSession.twilioCallSid.startsWith('CA')
         ? client.calls(callSession.twilioCallSid).update({ url: redirectUrl, method: 'POST' })
