@@ -391,7 +391,7 @@ export function CallDetailModal({ isOpen, onClose, callId }: CallDetailModalProp
                 </CardHeader>
                 <CardContent>
                   <div className="space-y-2 max-h-60 overflow-y-auto">
-                    {callDetail.transcript.map((item, index) => (
+                   {[...callDetail.transcript].sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()).map((item, index) => (
                       <div key={index} className="text-sm">
                         <div className="flex items-center gap-2 text-xs text-gray-500">
                           <span>{formatTime(item.timestamp)}</span>
