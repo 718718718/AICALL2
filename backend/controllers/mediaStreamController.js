@@ -942,7 +942,8 @@ exports.handleMediaStream = async (twilioWs, req) => {
   let textDeltaEventType = null;
   let hasGreeted = false;      // AIから先に第一声（開始挨拶）を出したか
   let sessionIsReady = false;  // session.updated（設定反映）を受信済みか
-
+　let pendingAudioChunks = []; // セッション準備前に届いた音声を退避（最初の発話を守る）
+  
   // ✅ Cartesia音声再生完了後に沈黙タイマーを開始するコールバック
   function startSilenceTimerAfterDrain(drainedCtxId) {
     if (pendingHandoff || pendingCallEnd) return;
@@ -1074,13 +1075,18 @@ exports.handleMediaStream = async (twilioWs, req) => {
       console.log('[Twilio→Backend] Received message:', JSON.stringify(data).substring(0, 200), 'callId:', callId);
       console.log('[Twilio→Backend] Event type:', data.event || 'NO EVENT FIELD');
 
-      if (data.event === 'media' && openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+      if (data.event === 'media') {
         latestMediaTimestamp = parseInt(data.media.timestamp);
-        const audioAppend = {
-          type: "input_audio_buffer.append",
-          audio: data.media.payload
-        };
-        openaiWs.send(JSON.stringify(audioAppend));
+        if (sessionIsReady && openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+          openaiWs.send(JSON.stringify({
+            type: "input_audio_buffer.append",
+            audio: data.media.payload
+          }));
+        } else {
+          // セッション準備前の音声は退避しておく（上限 約16秒）
+          pendingAudioChunks.push(data.media.payload);
+          if (pendingAudioChunks.length > 800) pendingAudioChunks.shift();
+        }
       }
 
       else if (data.event === 'start') {
@@ -1095,12 +1101,7 @@ exports.handleMediaStream = async (twilioWs, req) => {
           connection.streamSid = streamSid;
           console.log('[MediaStream] Updated streamSid in global map:', callId);
         }
-        // セッション設定が既に反映済みなら、AIから先に開始挨拶を出す（1回だけ）
-        if (sessionIsReady && !hasGreeted && openaiWs && openaiWs.readyState === WebSocket.OPEN) {
-          hasGreeted = true;
-          console.log('[Greeting] stream started & session ready — 初回挨拶を送信');
-          openaiWs.send(JSON.stringify({ type: 'response.create' }));
-        }
+        
       }
 
       else if (data.event === 'mark') {
@@ -1371,10 +1372,13 @@ exports.handleMediaStream = async (twilioWs, req) => {
         // ストリーム開始済みなら、AIから先に開始挨拶を出す（1回だけ）。
         if (response.type === 'session.updated') {
           sessionIsReady = true;
-          if (!hasGreeted && streamSid && openaiWs && openaiWs.readyState === WebSocket.OPEN) {
-            hasGreeted = true;
-            console.log('[Greeting] session.updated & stream ready — 初回挨拶を送信');
-            openaiWs.send(JSON.stringify({ type: 'response.create' }));
+          // 準備前に退避しておいた音声を、ここでまとめて流し込む（最初の発話を復元）
+          if (pendingAudioChunks.length && openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+            console.log('[Audio] session.updated — 退避音声', pendingAudioChunks.length, 'チャンクを流し込み');
+            for (const payload of pendingAudioChunks) {
+              openaiWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: payload }));
+            }
+            pendingAudioChunks = [];
           }
         }
         if (response.type && response.type.includes('function') || response.type && response.type.includes('output_item')) {
