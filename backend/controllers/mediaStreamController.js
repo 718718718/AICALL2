@@ -1278,15 +1278,7 @@ exports.handleMediaStream = async (twilioWs, req) => {
           console.error('[Cartesia] error event:', msg);
         }
       });
-　　　// Cartesia接続を作成済み。ここで初めて退避音声を流し込む。
-      // （初回応答の音声が確実にCartesiaへ渡るよう、session準備とCartesia準備の両方が整ってから流す）
-      if (pendingAudioChunks.length && openaiWs && openaiWs.readyState === WebSocket.OPEN) {
-        console.log('[Audio] flushing buffered audio:', pendingAudioChunks.length, 'chunks');
-        for (const payload of pendingAudioChunks) {
-          openaiWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: payload }));
-        }
-        pendingAudioChunks = [];
-      }
+　　　
       // 以降のライブ音声を受け付けてよい
       sessionIsReady = true;
       callSession.realtimeSessionId = 'session-' + Date.now();
@@ -1388,14 +1380,7 @@ exports.handleMediaStream = async (twilioWs, req) => {
             console.log('[Greeting] session.updated — AIから開始挨拶を発火');
             openaiWs.send(JSON.stringify({ type: 'response.create' }));
           }
-          // 準備前に退避しておいた音声を、ここでまとめて流し込む（最初の発話を復元）
-          if (pendingAudioChunks.length && openaiWs && openaiWs.readyState === WebSocket.OPEN) {
-            console.log('[Audio] session.updated — 退避音声', pendingAudioChunks.length, 'チャンクを流し込み');
-            for (const payload of pendingAudioChunks) {
-              openaiWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: payload }));
-            }
-            pendingAudioChunks = [];
-          }
+          
         }
         if (response.type && response.type.includes('function') || response.type && response.type.includes('output_item')) {
           console.log('[OpenAI DEBUG] Event type:', response.type);
