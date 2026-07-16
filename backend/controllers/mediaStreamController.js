@@ -1382,6 +1382,12 @@ exports.handleMediaStream = async (twilioWs, req) => {
         // ストリーム開始済みなら、AIから先に開始挨拶を出す（1回だけ）。
         if (response.type === 'session.updated') {
           sessionIsReady = true;
+          // つながった直後に、AIから開始挨拶を話し出す（相手の発話を待たない）
+          if (!hasGreeted && openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+            hasGreeted = true;
+            console.log('[Greeting] session.updated — AIから開始挨拶を発火');
+            openaiWs.send(JSON.stringify({ type: 'response.create' }));
+          }
           // 準備前に退避しておいた音声を、ここでまとめて流し込む（最初の発話を復元）
           if (pendingAudioChunks.length && openaiWs && openaiWs.readyState === WebSocket.OPEN) {
             console.log('[Audio] session.updated — 退避音声', pendingAudioChunks.length, 'チャンクを流し込み');
