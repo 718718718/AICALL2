@@ -1382,6 +1382,9 @@ exports.handleMediaStream = async (twilioWs, req) => {
               openaiWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: payload }));
             }
             pendingAudioChunks = [];
+            // まとめて流し込んだ音声は末尾の無音が無くserver_vadが発火しないので、
+            // 明示的にバッファを確定して応答生成をトリガーする
+            openaiWs.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
           }
         }
         if (response.type && response.type.includes('function') || response.type && response.type.includes('output_item')) {
