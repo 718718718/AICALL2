@@ -1232,7 +1232,19 @@ exports.handleMediaStream = async (twilioWs, req) => {
       console.log('[OpenAI] Connected to Realtime API');
 
       await initializeSession(openaiWs, agentSettings);
-
+　　// session.update を送信済み。WebSocketは送信順に処理されるので、
+      // これ以降に流す音声は必ず「設定適用後」に処理される（session.updated の受信を待たない）。
+      // まず、準備前に退避しておいた音声をまとめて流し込む（最初の発話を復元）。
+      if (pendingAudioChunks.length && openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+        console.log('[Audio] session.update sent — 退避音声', pendingAudioChunks.length, 'チャンクを流し込み');
+        for (const payload of pendingAudioChunks) {
+          openaiWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: payload }));
+        }
+        pendingAudioChunks = [];
+      }
+      // 以降のライブ音声を受け付けてよい
+      sessionIsReady = true;
+      
       // ✅ 古いCartesia接続が残っていればクローズ
       if (cartesiaWs && cartesiaWs.readyState === WebSocket.OPEN) {
         console.log('[Cartesia] Closing stale connection before creating new one');
