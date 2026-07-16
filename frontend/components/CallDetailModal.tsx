@@ -302,8 +302,7 @@ export function CallDetailModal({ isOpen, onClose, callId }: CallDetailModalProp
                           onClick={() => {
                             // プロキシエンドポイント経由でTwilioから録音をダウンロード
                             const token = localStorage.getItem("accessToken");
-                            const apiUrl = process.env.NEXT_PUBLIC_API_URL || '';
-                            const downloadUrl = `${apiUrl}/api/call-history/${callDetail.id}/recording`;
+                           const downloadUrl = `/api/call-history/${callDetail.id}/recording`;
 
                             // 認証付きでダウンロード
                             fetch(downloadUrl, {
