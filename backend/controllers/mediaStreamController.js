@@ -940,6 +940,8 @@ exports.handleMediaStream = async (twilioWs, req) => {
   let currentResponseId = null;
   let cartesiaContextId = null;
   let textDeltaEventType = null;
+  let hasGreeted = false;      // AIから先に第一声（開始挨拶）を出したか
+  let sessionIsReady = false;  // session.updated（設定反映）を受信済みか
 
   // ✅ Cartesia音声再生完了後に沈黙タイマーを開始するコールバック
   function startSilenceTimerAfterDrain(drainedCtxId) {
@@ -1092,6 +1094,12 @@ exports.handleMediaStream = async (twilioWs, req) => {
         if (connection) {
           connection.streamSid = streamSid;
           console.log('[MediaStream] Updated streamSid in global map:', callId);
+        }
+        // セッション設定が既に反映済みなら、AIから先に開始挨拶を出す（1回だけ）
+        if (sessionIsReady && !hasGreeted && openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+          hasGreeted = true;
+          console.log('[Greeting] stream started & session ready — 初回挨拶を送信');
+          openaiWs.send(JSON.stringify({ type: 'response.create' }));
         }
       }
 
@@ -1359,7 +1367,16 @@ exports.handleMediaStream = async (twilioWs, req) => {
     openaiWs.on('message', async (data) => {
       try {
         const response = JSON.parse(data.toString());
-
+　　　　 // セッション設定（instructions/VAD）が反映された合図。
+        // ストリーム開始済みなら、AIから先に開始挨拶を出す（1回だけ）。
+        if (response.type === 'session.updated') {
+          sessionIsReady = true;
+          if (!hasGreeted && streamSid && openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+            hasGreeted = true;
+            console.log('[Greeting] session.updated & stream ready — 初回挨拶を送信');
+            openaiWs.send(JSON.stringify({ type: 'response.create' }));
+          }
+        }
         if (response.type && response.type.includes('function') || response.type && response.type.includes('output_item')) {
           console.log('[OpenAI DEBUG] Event type:', response.type);
           console.log('[OpenAI DEBUG] Full response:', JSON.stringify(response, null, 2));
