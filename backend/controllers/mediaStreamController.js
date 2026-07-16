@@ -1372,15 +1372,17 @@ exports.handleMediaStream = async (twilioWs, req) => {
         const response = JSON.parse(data.toString());
 　　　　 // セッション設定（instructions/VAD）が反映された合図。
         // ストリーム開始済みなら、AIから先に開始挨拶を出す（1回だけ）。
-        if (response.type === 'session.updated') {
+       if (response.type === 'session.updated') {
           sessionIsReady = true;
-          // つながった直後に、AIから開始挨拶を話し出す（相手の発話を待たない）
-          if (!hasGreeted && openaiWs && openaiWs.readyState === WebSocket.OPEN) {
-            hasGreeted = true;
-            console.log('[Greeting] session.updated — AIから開始挨拶を発火');
-            openaiWs.send(JSON.stringify({ type: 'response.create' }));
+          // B方式：AIから先に話さない。相手の第一声（退避音声）をOpenAIへ流し込み、
+          // server_vadが「相手が話し終えた」と判定したら自動で応答させる。
+          if (pendingAudioChunks.length && openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+            console.log('[Audio] session.updated — 退避音声', pendingAudioChunks.length, 'チャンクを流し込み');
+            for (const payload of pendingAudioChunks) {
+              openaiWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: payload }));
+            }
+            pendingAudioChunks = [];
           }
-          
         }
         if (response.type && response.type.includes('function') || response.type && response.type.includes('output_item')) {
           console.log('[OpenAI DEBUG] Event type:', response.type);
