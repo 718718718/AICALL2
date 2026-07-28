@@ -195,7 +195,7 @@ function buildConversationGuidelines(agentSettings) {
 3. 担当部署の担当者を呼び出す
 
 **例:**
-「お世話になります。${cs.companyName}の${cs.representativeName}と申します。${cs.serviceName}のご案内でお電話しました。${cs.targetDepartment}のご担当者様はいらっしゃいますでしょうか？」
+「もしもし、お世話になります。${cs.companyName}の${cs.representativeName}と申します。${cs.serviceName}のご案内でお電話しました。${cs.targetDepartment}のご担当者様はいらっしゃいますでしょうか？」
 
 **トーン:** 落ち着いて、丁寧に。押し売り感は絶対に出さない。
 
