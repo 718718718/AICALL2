@@ -84,7 +84,7 @@ exports.startCall = asyncHandler(async (req, res, next) => {
 
     const call = await client.calls.create({
       to: customer.phone,
-      ...getByocCallParams(fromNumber),
+      ...getByocCallParams(fromNumber, user),
       ...amdParams,
       url: `${process.env.BASE_URL}/api/twilio/voice/conference/${callSession._id}`,
       statusCallback: `${process.env.BASE_URL}/api/twilio/call/status/${callSession._id}`,
