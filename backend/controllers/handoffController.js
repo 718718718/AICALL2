@@ -568,7 +568,7 @@ exports.initiateHandoffByPhone = asyncHandler(async (req, res, next) => {
     console.log(`[Handoff Debug] Error: No active call session found for customer`);
     return next(new ErrorResponse('現在進行中の通話がありません。通話中にのみ取次が可能です。', 404));
   }
-
+　　const callId = callSession._id.toString();
   // ユーザー情報を取得（開発環境のモックユーザーをスキップ）
   console.log(`[Handoff Debug] Getting user info for userId: ${userId}`);
   
