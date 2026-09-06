@@ -7,6 +7,7 @@ const twilio = require('twilio');
 const webSocketService = require('../services/websocket');
 const coefontService = require('../services/cartesiaService');
 const { getPublicBaseUrl } = require('../utils/publicUrl');
+const { getByocCallParams } = require('../utils/byocFrom');
 
 // Twilio client initialization
 const client = twilio(
@@ -122,20 +123,22 @@ exports.executeHandoffLogic = async (callSession, user, handoffMethod = 'manual'
       throw new Error('エージェントが割り当てられていません。運営会社にお問い合わせください。');
     }
     
-    const assignedAgentUser = await User.findById(callSession.assignedAgent);
-    if (!assignedAgentUser || !assignedAgentUser.twilioPhoneNumber || assignedAgentUser.twilioPhoneNumberStatus !== 'active') {
+        const assignedAgentUser = await User.findById(callSession.assignedAgent);
+    const hasByoc = assignedAgentUser && assignedAgentUser.byocFromNumber && assignedAgentUser.byocTrunkSid;
+    const hasTwilioNumber = assignedAgentUser && assignedAgentUser.twilioPhoneNumber && assignedAgentUser.twilioPhoneNumberStatus === 'active';
+    if (!assignedAgentUser || (!hasByoc && !hasTwilioNumber)) {
       throw new Error(
         '電話番号が割り当てられていません。運営会社にお問い合わせください。\n' +
         'No phone number assigned to this user. Please contact the administrator.'
       );
     }
     
-    const fromNumber = assignedAgentUser.twilioPhoneNumber;
-    console.log(`[Handoff] Using user's assigned number: ${fromNumber}`);
+    const byocParams = getByocCallParams(assignedAgentUser.twilioPhoneNumber, assignedAgentUser);
+    console.log(`[Handoff] Using from params:`, byocParams);
     
     const agentCall = await client.calls.create({
       to: agentPhoneNumber,
-      from: fromNumber,
+      ...byocParams,
       twiml: agentTwiml,
       timeout: 30,
       statusCallback: `${getPublicBaseUrl()}/api/twilio/handoff-status/${callId}`,
@@ -673,23 +676,25 @@ exports.initiateHandoffByPhone = asyncHandler(async (req, res, next) => {
       throw new Error('エージェントが割り当てられていません。運営会社にお問い合わせください。');
     }
     
-    const assignedAgentUser = await User.findById(callSession.assignedAgent);
-    if (!assignedAgentUser || !assignedAgentUser.twilioPhoneNumber || assignedAgentUser.twilioPhoneNumberStatus !== 'active') {
+       const assignedAgentUser = await User.findById(callSession.assignedAgent);
+    const hasByoc = assignedAgentUser && assignedAgentUser.byocFromNumber && assignedAgentUser.byocTrunkSid;
+    const hasTwilioNumber = assignedAgentUser && assignedAgentUser.twilioPhoneNumber && assignedAgentUser.twilioPhoneNumberStatus === 'active';
+    if (!assignedAgentUser || (!hasByoc && !hasTwilioNumber)) {
       throw new Error(
         '電話番号が割り当てられていません。運営会社にお問い合わせください。\n' +
         'No phone number assigned to this user. Please contact the administrator.'
       );
     }
     
-    const fromNumber = assignedAgentUser.twilioPhoneNumber;
-    console.log(`[Handoff] Using user's assigned number: ${fromNumber}`);
+    const byocParams = getByocCallParams(assignedAgentUser.twilioPhoneNumber, assignedAgentUser);
+    console.log(`[Handoff] Using from params:`, byocParams);
     
     // 担当者への発信と顧客リダイレクトを並列実行（高速化）
     const redirectUrl = `${getPublicBaseUrl()}/api/twilio/handoff-redirect/${callId}`;
     const [agentCall] = await Promise.all([
       client.calls.create({
         to: agentPhoneNumber,
-        from: fromNumber,
+        ...byocParams,
         twiml: agentTwiml,
         timeout: 30,
         statusCallback: `${getPublicBaseUrl()}/api/twilio/handoff-status/${callId}`,
