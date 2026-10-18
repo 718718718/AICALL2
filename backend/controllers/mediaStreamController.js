@@ -473,13 +473,13 @@ async function initializeSession(openaiWs, agentSettings) {
         {
           type: "function",
           name: "transfer_to_human",
-          description: "顧客が営業担当との会話を承諾した時、人間の営業担当に電話転送する。【重要】この関数は、顧客が「はい」「お願いします」と明確に同意した発言が『会話履歴に存在する』場合のみ呼び出すことができる。AIが質問した直後（顧客の回答前）に呼び出すことは固く禁じられている。",
+          description: "人間の営業担当に電話転送する。次のいずれかに当てはまったら、転送アナウンスと同じターンで即座に呼び出す（顧客の同意確認は不要）：①内線取次の後に担当者が電話口に出た（「お電話代わりました」「担当の○○です」）②相手が担当者だと名乗った（「担当者は私です」）③相手が用件を引き受けた（「私が伺います」「私が承ります」）。受付が名乗らずに用件を聞いただけの場合や、相手が断った場合は呼び出さない。",
           parameters: {
             type: "object",
             properties: {
               customer_consent: {
                 type: "boolean",
-                description: "顧客の明確な同意が会話履歴にあるか（true=ある、false=なし）。推測や「これから聞く」場合はfalseとする"
+                description: "上記①〜③の転送条件を満たしているか（true=満たしている）。受付が用件を聞いただけ、または相手が断った場合はfalse"
               },
               reason: {
                 type: "string",
