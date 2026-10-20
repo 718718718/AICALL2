@@ -81,7 +81,10 @@ exports.executeHandoffLogic = async (callSession, user, handoffMethod = 'manual'
     
     // 1. 担当者に電話をかける（CoeFont音声を使用）
     const agentMessage = 'お客様からのお電話です。接続します。';
-    const agentAudioUrl = await coefontService.generateSpeechUrl(agentMessage);
+    // ✅ CoeFontのキャッシュ音声URL（/api/audio/cache/...）がTwilioから取得できず404になり、
+    //    担当者側で「An application error has occurred」が流れて切れていた。
+    //    手動取次と同じく Polly.Mizuki の読み上げに統一する。
+    const agentAudioUrl = null;
     
     let agentTwiml;
     if (agentAudioUrl) {
