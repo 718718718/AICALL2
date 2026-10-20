@@ -460,7 +460,8 @@ async function initializeSession(openaiWs, agentSettings) {
             type: "server_vad",
             threshold: 0.4,        // 0.2は低すぎてエコー・ノイズで誤発火する
             prefix_padding_ms: 300,
-            silence_duration_ms: 600  // 短すぎると発話途中で切れる
+            silence_duration_ms: 600,  // 短すぎると発話途中で切れる
+            interrupt_response: false  // 割り込み（応答の中断）はアプリ側のbarge-in処理で判断する
           },
           transcription: {
             model: "gpt-4o-transcribe",
@@ -1044,6 +1045,11 @@ exports.handleMediaStream = async (twilioWs, req) => {
       c.id !== excludeId && !c.invalidated && !(c.doneFromCartesia && c.marks === 0));
   }
   let suppressedItemId = null; // 重ねて喋らせないことにしたAI発話のitem_id
+  let greetingPending = false;  // 開始挨拶の発話をまだ受け取っていない
+  // ✅ 開始挨拶（保護中）がまだ再生中か
+  function greetingPlaying() {
+    return liveContexts().some(c => c.protectedGreeting);
+  }
 
   let pendingHandoff = null;
   let handoffAwaitingAnnouncementCtx = false;
@@ -1396,6 +1402,7 @@ exports.handleMediaStream = async (twilioWs, req) => {
           // A方式：つながったらAIから先に開始挨拶を出す（1回だけ）
           if (!hasGreeted && openaiWs && openaiWs.readyState === WebSocket.OPEN) {
             hasGreeted = true;
+            greetingPending = true;
             console.log('[Greeting] session.updated — AIから開始挨拶を発火');
             openaiWs.send(JSON.stringify({ type: 'response.create' }));
           }
@@ -1437,7 +1444,7 @@ exports.handleMediaStream = async (twilioWs, req) => {
         if (isTextDelta && response.item_id && response.item_id !== lastAssistantItem) {
           const others = liveContexts();
           if (others.length > 0) {
-            if (others.some(c => c.terminating)) {
+            if (others.some(c => c.terminating || c.protectedGreeting)) {
               // 終話・転送アナウンス再生中 → 新しい発話を捨てる
               suppressedItemId = response.item_id;
               try { openaiWs.send(JSON.stringify({ type: 'response.cancel' })); } catch (e) {}
@@ -1465,6 +1472,12 @@ exports.handleMediaStream = async (twilioWs, req) => {
             currentResponseId = response.response_id || `resp-${Date.now()}`;
             cartesiaContextId = createCartesiaContextId(currentResponseId, response.item_id);
             playback.startContext(cartesiaContextId);
+            if (greetingPending) {
+              greetingPending = false;
+              const gctx = playback.contexts.get(cartesiaContextId);
+              if (gctx) gctx.protectedGreeting = true;
+              console.log('[Greeting] 開始挨拶を保護（顧客の「もしもし」で途切れさせない） ctx=' + cartesiaContextId);
+            }
             console.log('[Text] New assistant item:', response.item_id, '→ Cartesia context:', cartesiaContextId);
 
             // ── フィラー挿入：顧客が直前に話した場合のみ「はい。」を挿入 ──
@@ -1550,6 +1563,10 @@ exports.handleMediaStream = async (twilioWs, req) => {
           );
           if (hasTerminatingContext) {
             console.log('[barge-in] closing phrase in progress — ignoring speech_started');
+            return;
+          }
+          if (greetingPending || greetingPlaying()) {
+            console.log('[barge-in] 開始挨拶の再生中 — 割り込まずに最後まで話す');
             return;
           }
 
