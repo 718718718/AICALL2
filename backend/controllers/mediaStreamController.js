@@ -473,13 +473,13 @@ async function initializeSession(openaiWs, agentSettings) {
         {
           type: "function",
           name: "transfer_to_human",
-          description: "人間の営業担当に電話転送する。次のいずれかに当てはまったら、転送アナウンスと同じターンで即座に呼び出す（顧客の同意確認は不要）：①内線取次の後に担当者が電話口に出た（「お電話代わりました」「担当の○○です」）②相手が担当者だと名乗った（「担当者は私です」）③相手が用件を引き受けた（「私が伺います」「私が承ります」）。受付が名乗らずに用件を聞いただけの場合や、相手が断った場合は呼び出さない。",
+          description: "人間の営業担当に電話転送する。次のいずれかに当てはまったら、転送アナウンスと同じターンで即座に呼び出す（顧客の同意確認は不要）：⓪受付が担当者への取次を始めた（「担当者に代わります」「おつなぎします」「少々お待ちください」）→担当者が出るのを待たずに呼ぶ ①内線取次の後に担当者が電話口に出た（「お電話代わりました」「担当の○○です」）②相手が担当者だと名乗った（「担当者は私です」）③相手が用件を引き受けた（「私が伺います」「私が承ります」）。受付が名乗らずに用件を聞いただけの場合や、相手が断った場合は呼び出さない。",
           parameters: {
             type: "object",
             properties: {
               customer_consent: {
                 type: "boolean",
-                description: "上記①〜③の転送条件を満たしているか（true=満たしている）。受付が用件を聞いただけ、または相手が断った場合はfalse"
+                description: "上記⓪〜③の転送条件を満たしているか（true=満たしている）。受付が用件を聞いただけ、または相手が断った場合はfalse"
               },
               reason: {
                 type: "string",
@@ -947,6 +947,11 @@ exports.handleMediaStream = async (twilioWs, req) => {
   // ✅ Cartesia音声再生完了後に沈黙タイマーを開始するコールバック
   function startSilenceTimerAfterDrain(drainedCtxId) {
     if (pendingHandoff || pendingCallEnd) return;
+    // ✅ 別の発話がまだ再生中なら、それが終わった時の drain で改めて開始する
+    if (liveContexts(drainedCtxId).length > 0 || cartesiaContextId) {
+      console.log('[SilenceDetection] drain(ctx=' + drainedCtxId + ') だが他の発話が再生中 — タイマー開始を見送り');
+      return;
+    }
     if (customerSilenceTimer) {
       clearTimeout(customerSilenceTimer);
     }
@@ -963,6 +968,10 @@ exports.handleMediaStream = async (twilioWs, req) => {
     console.log(`[SilenceDetection] Cartesia drain完了(ctx=${drainedCtxId}) → customerHasSpoken=${customerHasSpoken}, タイマー開始 (check ${customerSilenceCheckCount + 1}, ${timeoutDuration}ms)`);
 
     customerSilenceTimer = setTimeout(() => {
+      if (liveContexts().length > 0 || cartesiaContextId) {
+        console.log('[SilenceDetection] AI発話中のため確認メッセージをスキップ');
+        return;
+      }
       console.log(`[SilenceDetection] ${timeoutDuration / 1000}秒の沈黙を検知`);
 
       if (customerSilenceCheckCount === 0) {
@@ -1029,6 +1038,13 @@ exports.handleMediaStream = async (twilioWs, req) => {
   const playback = createPlaybackTracker({ onDrain: startSilenceTimerAfterDrain });
   const markQueue = playback.markQueue;
 
+  // ✅ まだ再生中（または生成中）のCartesia contextを返す
+  function liveContexts(excludeId = null) {
+    return [...playback.contexts.values()].filter(c =>
+      c.id !== excludeId && !c.invalidated && !(c.doneFromCartesia && c.marks === 0));
+  }
+  let suppressedItemId = null; // 重ねて喋らせないことにしたAI発話のitem_id
+
   let pendingHandoff = null;
   let handoffAwaitingAnnouncementCtx = false;
   let handoffFallbackTimer = null;
@@ -1036,6 +1052,9 @@ exports.handleMediaStream = async (twilioWs, req) => {
   let handoffCompleted = false;
   let pendingCallEnd = null;
   let lastCompletedCtxId = null;
+  let lastCompletedCtxResponseId = null; // lastCompletedCtxId を生んだ response_id（同一ターン判定用）
+  let handoffAnnouncementRequested = false; // アナウンス無しで関数だけ呼ばれた場合に1回だけ response.create する
+  let suppressCancelSent = false;          // 転送確定後の余計なAI発話に response.cancel を送ったか
 
   let customerSilenceTimer = null;
   let customerSilenceCheckCount = 0;
@@ -1400,6 +1419,40 @@ exports.handleMediaStream = async (twilioWs, req) => {
         }
         const isTextDelta = isDeltaCandidate && response.type === textDeltaEventType;
 
+        // ✅ 転送アナウンスが確定した後に生成された別の発話は喋らせない（二重発話＝輪唱の防止）
+        if (isTextDelta && pendingHandoff && pendingHandoff.ctxId && !handoffAwaitingAnnouncementCtx &&
+            !pendingHandoff.ctxId.endsWith('-' + response.item_id)) {
+          if (!suppressCancelSent && openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+            suppressCancelSent = true;
+            try { openaiWs.send(JSON.stringify({ type: 'response.cancel' })); } catch (e) {}
+          }
+          console.log('[AutoHandoff] extra assistant speech after announcement suppressed item=' + response.item_id);
+          return;
+        }
+
+        if (isTextDelta && suppressedItemId && response.item_id === suppressedItemId) {
+          return; // 重ねないと決めた発話の続き
+        }
+
+        if (isTextDelta && response.item_id && response.item_id !== lastAssistantItem) {
+          const others = liveContexts();
+          if (others.length > 0) {
+            if (others.some(c => c.terminating)) {
+              // 終話・転送アナウンス再生中 → 新しい発話を捨てる
+              suppressedItemId = response.item_id;
+              try { openaiWs.send(JSON.stringify({ type: 'response.cancel' })); } catch (e) {}
+              console.warn('[Overlap] closing/handoff phrase playing — new speech suppressed item=' + response.item_id);
+              return;
+            }
+            // 通常の発話が残っている → 古い方を止めて新しい方だけを流す（二重再生＝輪唱の防止）
+            console.warn('[Overlap] previous speech still playing (' + others.map(c => c.id).join(',') + ') — stopping it before new item ' + response.item_id);
+            playback.invalidateAll('overlap');
+            if (twilioWs && twilioWs.readyState === WebSocket.OPEN && streamSid) {
+              try { twilioWs.send(JSON.stringify({ event: 'clear', streamSid })); } catch (e) {}
+            }
+          }
+        }
+
         if (isTextDelta) {
           if (customerSilenceTimer) {
             clearTimeout(customerSilenceTimer);
@@ -1465,7 +1518,9 @@ exports.handleMediaStream = async (twilioWs, req) => {
                            response.type === 'response.output_text.done';
         if (isTextDone && cartesiaContextId) {
           // ✅ function callによるclosing phraseが既にセットされている場合はテキスト応答を無視
-          if (pendingCallEnd || pendingHandoff) {
+          const isBoundHandoffAnnouncement = !!(pendingHandoff && pendingHandoff.ctxId &&
+                                                pendingHandoff.ctxId === cartesiaContextId);
+          if ((pendingCallEnd || pendingHandoff) && !isBoundHandoffAnnouncement) {
             console.log('[TextDone] skipping — pendingCallEnd/Handoff already set, dropping duplicate speech');
             textBuffer = '';
             cartesiaContextId = null;
@@ -1474,8 +1529,10 @@ exports.handleMediaStream = async (twilioWs, req) => {
             sendToCartesia(cartesiaWs, textBuffer, cartesiaContextId, true, cartesiaVoiceId, cartesiaSpeed);
             textBuffer = '';
           }
-          sendToCartesia(cartesiaWs, '', cartesiaContextId, false);
+          sendToCartesia(cartesiaWs, '', cartesiaContextId, false, cartesiaVoiceId, cartesiaSpeed);
           lastCompletedCtxId = cartesiaContextId;
+          lastCompletedCtxResponseId = currentResponseId;
+          if (isBoundHandoffAnnouncement) handoffAwaitingAnnouncementCtx = false;
           cartesiaContextId = null;
           } // end else (not pendingCallEnd/Handoff)
         }
@@ -1696,7 +1753,11 @@ exports.handleMediaStream = async (twilioWs, req) => {
 
           if (pendingHandoff) {
             const ctxId = pendingHandoff.ctxId;
-            if (!ctxId || lastCompletedCtxId !== ctxId) {
+            if (!ctxId && !handoffAnnouncementRequested && openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+              handoffAnnouncementRequested = true;
+              console.log('[AutoHandoff] no announcement in this turn — requesting one');
+              openaiWs.send(JSON.stringify({ type: 'response.create' }));
+            } else if (!ctxId || lastCompletedCtxId !== ctxId) {
               console.log('[AutoHandoff] response.done but announcement ctx not finalized yet (ctxId=' + ctxId + ', lastCompleted=' + lastCompletedCtxId + ') — waiting');
             } else {
               handoffAwaitingAnnouncementCtx = false;
@@ -1746,14 +1807,36 @@ exports.handleMediaStream = async (twilioWs, req) => {
                 ctxId: null
               };
               handoffAwaitingAnnouncementCtx = true;
+              handoffAnnouncementRequested = false;
+              suppressCancelSent = false;
+
+              // ✅ 同じターンで既に転送アナウンスを喋っていれば、それに紐付ける
+              const fnResponseId = response.response_id;
+              let sameTurnCtx = null;
+              if (cartesiaContextId && currentResponseId === fnResponseId) {
+                sameTurnCtx = cartesiaContextId;            // まだテキスト生成中
+              } else if (lastCompletedCtxId && lastCompletedCtxResponseId === fnResponseId) {
+                sameTurnCtx = lastCompletedCtxId;           // テキスト生成は完了、再生中 or 再生済み
+              }
 
               if (handoffFallbackTimer) clearTimeout(handoffFallbackTimer);
-              handoffFallbackTimer = setTimeout(() => {
-                if (!handoffCompleted) {
-                  console.warn('[AutoHandoff] announcement did not complete within fallback window — executing handoff directly');
-                  completeHandoff('fallback-timeout');
-                }
-              }, HANDOFF_ANNOUNCE_FALLBACK_MS);
+              if (sameTurnCtx) {
+                pendingHandoff.ctxId = sameTurnCtx;
+                scheduledHandoffCtxId = sameTurnCtx;
+                if (sameTurnCtx !== cartesiaContextId) handoffAwaitingAnnouncementCtx = false;
+                playback.scheduleHangupOnDrain(sameTurnCtx, () => {
+                  console.log('[AutoHandoff] audio drained — executing handoff');
+                  completeHandoff('drain');
+                });
+                console.log('[AutoHandoff] bound to same-turn announcement ctx=' + sameTurnCtx + ' (no extra response.create)');
+              } else {
+                handoffFallbackTimer = setTimeout(() => {
+                  if (!handoffCompleted) {
+                    console.warn('[AutoHandoff] announcement did not complete within fallback window — executing handoff directly');
+                    completeHandoff('fallback-timeout');
+                  }
+                }, HANDOFF_ANNOUNCE_FALLBACK_MS);
+              }
 
               if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
                 const functionOutput = {
@@ -1769,7 +1852,8 @@ exports.handleMediaStream = async (twilioWs, req) => {
                 };
                 openaiWs.send(JSON.stringify(functionOutput));
                 console.log('[FunctionCall] Sent function result to OpenAI (handoff pending)');
-                openaiWs.send(JSON.stringify({ type: 'response.create' }));
+                // ✅ ここでは response.create を送らない（送ると同じアナウンスをもう一度生成し、二重発話になる）
+                //    アナウンス無しで関数だけ呼ばれた場合は response.done で1回だけ要求する
               }
             } catch (error) {
               console.error('[FunctionCall] Error parsing function arguments:', error);
