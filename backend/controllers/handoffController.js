@@ -16,96 +16,42 @@ const client = twilio(
 );
 
 /**
- * Execute handoff logic (shared between manual and auto handoff)
- * @param {Object} callSession - CallSession document
- * @param {Object} user - User document with handoff phone number
- * @param {String} handoffMethod - 'manual' or 'ai-auto'
- * @param {String} handoffReason - Reason for handoff (optional)
- * @returns {Object} Result with handoffCallSid, conferenceName, etc.
+ * 取次の第1段階：担当者へ発信する（顧客はまだAIと通話中のまま）
+ * 受付が「少々お待ちください」と言った時点で呼び、AIのお礼アナウンスと並行して担当者の電話を鳴らす。
+ * @returns {Object} { callId, agentCallSid, conferenceName, agentPhoneNumber }
  */
-exports.executeHandoffLogic = async (callSession, user, handoffMethod = 'manual', handoffReason = null) => {
+exports.dialAgentForHandoff = async (callSession, user, handoffMethod = 'manual') => {
   const callId = callSession._id.toString();
+  const t0 = Date.now();
 
-  console.log('[Handoff] Executing handoff logic');
-  console.log('[Handoff] Method:', handoffMethod);
-  console.log('[Handoff] Call ID:', callId);
+  // ユーザーの取次用電話番号
+  let agentPhoneNumber;
+  if (user.getTwilioPhoneNumber && typeof user.getTwilioPhoneNumber === 'function') {
+    agentPhoneNumber = user.getTwilioPhoneNumber();
+  } else if (user.handoffPhoneNumber) {
+    agentPhoneNumber = user.handoffPhoneNumber.startsWith('0')
+      ? `+81${user.handoffPhoneNumber.substring(1)}`
+      : `+81${user.handoffPhoneNumber}`;
+  } else {
+    throw new Error('取次用電話番号が設定されていません');
+  }
+  console.log(`[Handoff] Using user handoff number: ${agentPhoneNumber}`);
 
-  try {
-    // Check if this is an OpenAI Realtime API call (Media Streams mode)
-    const isRealtimeMode = process.env.USE_OPENAI_REALTIME === 'true';
-    console.log('[Handoff] Realtime mode:', isRealtimeMode);
+  const updateData = {
+    status: 'transferring',
+    'handoffDetails.requestedAt': new Date(),
+    'handoffDetails.handoffPhoneNumber': agentPhoneNumber,
+    'handoffDetails.handoffMethod': handoffMethod
+  };
+  const userIdStr = user._id.toString();
+  if (!['dev-user-id', 'direct-user-id', 'test-user-id'].includes(userIdStr)) {
+    updateData['handoffDetails.requestedBy'] = user._id;
+  }
 
-    // Note: In Realtime mode, we will disconnect Media Streams AFTER redirect succeeds
-    // Disconnecting before redirect causes call to drop
-
-    // ユーザーの取次用電話番号を使用（さらに安全な処理）
-    let agentPhoneNumber;
-    try {
-      if (user.getTwilioPhoneNumber && typeof user.getTwilioPhoneNumber === 'function') {
-        agentPhoneNumber = user.getTwilioPhoneNumber();
-      } else if (user.handoffPhoneNumber) {
-        // 日本の番号を国際形式に変換
-        agentPhoneNumber = user.handoffPhoneNumber.startsWith('0')
-          ? `+81${user.handoffPhoneNumber.substring(1)}`
-          : `+81${user.handoffPhoneNumber}`;
-      } else {
-        throw new Error('取次用電話番号が設定されていません');
-      }
-      console.log(`[Handoff] Using user handoff number: ${agentPhoneNumber}`);
-    } catch (phoneError) {
-      console.error('[Handoff] Error processing phone number:', phoneError);
-      return next(new ErrorResponse('取次用電話番号の処理に失敗しました。', 400));
-    }
-
-    // 通話セッションを更新（取次開始）
-    // モックユーザーの場合はrequestByをnullにする
-    const updateData = {
-      status: 'transferring',
-      'handoffDetails.requestedAt': new Date(),
-      'handoffDetails.handoffPhoneNumber': agentPhoneNumber,
-      'handoffDetails.handoffMethod': handoffMethod
-    };
-    
-    // モックユーザーでない場合のみrequestByを設定
-    const userIdStr = user._id.toString();
-    if (!['dev-user-id', 'direct-user-id', 'test-user-id'].includes(userIdStr)) {
-      updateData['handoffDetails.requestedBy'] = user._id;
-    }
-    
-    await CallSession.findByIdAndUpdate(callId, updateData);
-
-    // 担当者に電話をかけて、Conference経由で接続
-    console.log(`[Handoff] Creating conference call to agent ${agentPhoneNumber}`);
-    
-    const conferenceName = `handoff-${callId}`;
-    
-    // 1. 担当者に電話をかける（CoeFont音声を使用）
-    const agentMessage = 'お客様からのお電話です。接続します。';
-    // ✅ CoeFontのキャッシュ音声URL（/api/audio/cache/...）がTwilioから取得できず404になり、
-    //    担当者側で「An application error has occurred」が流れて切れていた。
-    //    手動取次と同じく Polly.Mizuki の読み上げに統一する。
-    const agentAudioUrl = null;
-    
-    let agentTwiml;
-    if (agentAudioUrl) {
-      // CoeFontの音声URLを使用
-      agentTwiml = `<Response>
-        <Play>${agentAudioUrl}</Play>
-        <Dial>
-          <Conference
-            startConferenceOnEnter="true"
-            endConferenceOnExit="true"
-            record="record-from-start"
-            recordingStatusCallback="${getPublicBaseUrl()}/api/twilio/recording/status/${callId}"
-            recordingStatusCallbackMethod="POST"
-            statusCallback="${getPublicBaseUrl()}/api/twilio/conference/events/${callId}"
-            statusCallbackMethod="POST"
-            statusCallbackEvent="start end join leave mute hold">${conferenceName}</Conference>
-        </Dial>
-      </Response>`;
-    } else {
-      // フォールバック: Polly.Mizukiを使用
-      agentTwiml = `<Response>
+  const conferenceName = `handoff-${callId}`;
+  const agentMessage = 'お客様からのお電話です。接続します。';
+  // CoeFontのキャッシュ音声は404になっていたため Polly.Mizuki の読み上げに統一（10/20）
+  const agentTwiml = `<Response>
         <Say voice="Polly.Mizuki" language="ja-JP">${agentMessage}</Say>
         <Dial>
           <Conference
@@ -119,109 +65,148 @@ exports.executeHandoffLogic = async (callSession, user, handoffMethod = 'manual'
             statusCallbackEvent="start end join leave mute hold">${conferenceName}</Conference>
         </Dial>
       </Response>`;
-    }
-    
-    // CallSessionからユーザーIDを取得して番号を確認
-    if (!callSession.assignedAgent) {
-      throw new Error('エージェントが割り当てられていません。運営会社にお問い合わせください。');
-    }
-    
-        const assignedAgentUser = await User.findById(callSession.assignedAgent);
-    const hasByoc = assignedAgentUser && assignedAgentUser.byocFromNumber && assignedAgentUser.byocTrunkSid;
-    const hasTwilioNumber = assignedAgentUser && assignedAgentUser.twilioPhoneNumber && assignedAgentUser.twilioPhoneNumberStatus === 'active';
-    if (!assignedAgentUser || (!hasByoc && !hasTwilioNumber)) {
-      throw new Error(
-        '電話番号が割り当てられていません。運営会社にお問い合わせください。\n' +
-        'No phone number assigned to this user. Please contact the administrator.'
-      );
-    }
-    
-    const byocParams = getByocCallParams(assignedAgentUser.twilioPhoneNumber, assignedAgentUser);
-    console.log(`[Handoff] Using from params:`, byocParams);
-    
-    const agentCall = await client.calls.create({
-      to: agentPhoneNumber,
-      ...byocParams,
-      twiml: agentTwiml,
-      timeout: 30,
-      statusCallback: `${getPublicBaseUrl()}/api/twilio/handoff-status/${callId}`,
-      statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed']
-    });
-    
-    console.log(`[Handoff] Agent call created: ${agentCall.sid}`);
-    
-    // 2. 顧客をConferenceに移動
-    // Media Streams mode (<Connect><Stream>) では直接TwiML更新できないため、
-    // Redirectを使って新しいエンドポイントに誘導する
-    if (callSession.twilioCallSid && callSession.twilioCallSid.startsWith('CA')) {
-      console.log(`[Handoff] Moving customer to conference using Redirect`);
 
-      // Redirectエンドポイントを使用（Media Streams互換）
-      const redirectUrl = `${getPublicBaseUrl()}/api/twilio/handoff-redirect/${callId}`;
+  if (!callSession.assignedAgent) {
+    throw new Error('エージェントが割り当てられていません。運営会社にお問い合わせください。');
+  }
 
-      try {
-        await client.calls(callSession.twilioCallSid).update({
-          url: redirectUrl,
-          method: 'POST'
-        });
-        console.log(`[Handoff] Customer redirected to: ${redirectUrl}`);
-      } catch (updateError) {
-        console.error(`[Handoff] Error updating call:`, updateError.message);
+  // ✅ 速度改善：取次開始のDB更新と発信元ユーザーの取得を並行して行う
+  const [, assignedAgentUser] = await Promise.all([
+    CallSession.findByIdAndUpdate(callId, updateData),
+    User.findById(callSession.assignedAgent)
+  ]);
+  const hasByoc = assignedAgentUser && assignedAgentUser.byocFromNumber && assignedAgentUser.byocTrunkSid;
+  const hasTwilioNumber = assignedAgentUser && assignedAgentUser.twilioPhoneNumber && assignedAgentUser.twilioPhoneNumberStatus === 'active';
+  if (!assignedAgentUser || (!hasByoc && !hasTwilioNumber)) {
+    throw new Error(
+      '電話番号が割り当てられていません。運営会社にお問い合わせください。\n' +
+      'No phone number assigned to this user. Please contact the administrator.'
+    );
+  }
 
-        // Redirectが失敗した場合でもConference URLを保存（webhook経由で処理）
-        await CallSession.findByIdAndUpdate(callId, {
-          'handoffDetails.pendingConferenceName': conferenceName,
-          'handoffDetails.redirectUrl': redirectUrl
-        });
+  const byocParams = getByocCallParams(assignedAgentUser.twilioPhoneNumber, assignedAgentUser);
+  console.log(`[Handoff] Using from params:`, byocParams);
 
-        console.log(`[Handoff] Saved conference details for webhook processing`);
-      }
-    } else {
-      // 担当者への通話をキャンセル
-      await client.calls(agentCall.sid).update({ status: 'completed' });
-      throw new Error('Invalid call session');
-    }
+  const agentCall = await client.calls.create({
+    to: agentPhoneNumber,
+    ...byocParams,
+    twiml: agentTwiml,
+    timeout: 30,
+    statusCallback: `${getPublicBaseUrl()}/api/twilio/handoff-status/${callId}`,
+    statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed']
+  });
+  console.log(`[Handoff] Agent call created: ${agentCall.sid} (+${Date.now() - t0}ms)`);
 
-    // 取次詳細を更新
+  // 取次詳細を保存（顧客のRedirect時に handoffRedirectController が conferenceName を読む）
+  await CallSession.findByIdAndUpdate(callId, {
+    'handoffDetails.handoffCallSid': agentCall.sid,
+    'handoffDetails.conferenceName': conferenceName
+  });
+
+  return { callId, agentCallSid: agentCall.sid, conferenceName, agentPhoneNumber };
+};
+
+/**
+ * 取次の第2段階：顧客をConferenceへ移す（AIのアナウンスが流れ終わった後に呼ぶ）
+ */
+exports.moveCustomerToConference = async (callSession, user, dial) => {
+  const { callId, agentCallSid, conferenceName, agentPhoneNumber } = dial;
+
+  // Media Streams mode (<Connect><Stream>) では直接TwiML更新できないため、Redirectで誘導する
+  if (!(callSession.twilioCallSid && callSession.twilioCallSid.startsWith('CA'))) {
+    await exports.cancelAgentDial(callId, agentCallSid, 'invalid call session');
+    throw new Error('Invalid call session');
+  }
+
+  console.log(`[Handoff] Moving customer to conference using Redirect`);
+  const redirectUrl = `${getPublicBaseUrl()}/api/twilio/handoff-redirect/${callId}`;
+  try {
+    await client.calls(callSession.twilioCallSid).update({ url: redirectUrl, method: 'POST' });
+    console.log(`[Handoff] Customer redirected to: ${redirectUrl}`);
+  } catch (updateError) {
+    console.error(`[Handoff] Error updating call:`, updateError.message);
+    // Redirectが失敗した場合でもConference URLを保存（webhook経由で処理）
     await CallSession.findByIdAndUpdate(callId, {
-      status: 'transferring',
-      'handoffDetails.handoffCallSid': agentCall.sid,
-      'handoffDetails.conferenceName': conferenceName
+      'handoffDetails.pendingConferenceName': conferenceName,
+      'handoffDetails.redirectUrl': redirectUrl
     });
+    console.log(`[Handoff] Saved conference details for webhook processing`);
+  }
 
-    // WebSocketで通知
-    webSocketService.emitToUser(callSession.userId, 'handoff-initiated', {
-      callId,
-      agentId: user._id,
-      agentCallSid: agentCall.sid,
-      timestamp: new Date()
-    });
+  webSocketService.emitToUser(callSession.userId, 'handoff-initiated', {
+    callId,
+    agentId: user._id,
+    agentCallSid,
+    timestamp: new Date()
+  });
 
-    // 取次開始時の案内メッセージをトランスクリプトに追加
-    const customer = callSession.customerId;
-    webSocketService.sendTranscriptUpdate(callId, {
-      speaker: 'system',
-      message: '担当者に接続中...',
-      phoneNumber: customer ? customer.phone : '',
-      timestamp: new Date()
-    });
+  const customer = callSession.customerId;
+  webSocketService.sendTranscriptUpdate(callId, {
+    speaker: 'system',
+    message: '担当者に接続中...',
+    phoneNumber: customer ? customer.phone : '',
+    timestamp: new Date()
+  });
 
-    // Return result data
-    return {
-      callId,
-      handoffCallSid: agentCall.sid,
-      status: 'connecting',
-      conferenceName,
-      agentPhoneNumber: agentPhoneNumber.replace(/(\d{3})\d{4}(\d{4})/, '$1****$2')  // マスク表示
-    };
+  return {
+    callId,
+    handoffCallSid: agentCallSid,
+    status: 'connecting',
+    conferenceName,
+    agentPhoneNumber: agentPhoneNumber.replace(/(\d{3})\d{4}(\d{4})/, '$1****$2')  // マスク表示
+  };
+};
 
-  } catch (error) {
-    // エラー時は状態を戻す
+/**
+ * 先行発信した担当者への通話を取り消す（受付が言い直した／顧客が切った／転送失敗など）
+ */
+exports.cancelAgentDial = async (callId, agentCallSid, reason = '') => {
+  console.log(`[Handoff] Cancelling agent call ${agentCallSid} reason=${reason}`);
+  if (agentCallSid) {
+    try {
+      // 呼び出し中なら canceled、すでに出ていれば completed で切る
+      await client.calls(agentCallSid).update({ status: 'canceled' });
+    } catch (e) {
+      try {
+        await client.calls(agentCallSid).update({ status: 'completed' });
+      } catch (e2) {
+        console.error('[Handoff] Failed to cancel agent call:', e2.message);
+      }
+    }
+  }
+  try {
     await CallSession.findByIdAndUpdate(callId, {
       status: 'ai-responding',
       $unset: { handoffDetails: 1 }
     });
+  } catch (e) {
+    console.error('[Handoff] Failed to reset call session after cancel:', e.message);
+  }
+};
 
+/**
+ * Execute handoff logic (shared between manual and auto handoff)
+ * 発信と顧客の移動を続けて行う（手動取次で使用）
+ */
+exports.executeHandoffLogic = async (callSession, user, handoffMethod = 'manual', handoffReason = null) => {
+  const callId = callSession._id.toString();
+  console.log('[Handoff] Executing handoff logic');
+  console.log('[Handoff] Method:', handoffMethod);
+  console.log('[Handoff] Call ID:', callId);
+
+  let dial = null;
+  try {
+    dial = await exports.dialAgentForHandoff(callSession, user, handoffMethod);
+    return await exports.moveCustomerToConference(callSession, user, dial);
+  } catch (error) {
+    if (dial && dial.agentCallSid) {
+      await exports.cancelAgentDial(callId, dial.agentCallSid, 'handoff failed');
+    } else {
+      await CallSession.findByIdAndUpdate(callId, {
+        status: 'ai-responding',
+        $unset: { handoffDetails: 1 }
+      });
+    }
     throw new Error(`Failed to initiate handoff: ${error.message}`);
   }
 };

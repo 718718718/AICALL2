@@ -97,7 +97,12 @@ function handleDeterministicCallEnd({ endType, phrase, item, openaiWs, cartesiaW
 async function executeHandoffWithFallback(callSession, handoffData, twilioWs, getStreamSid, cartesiaWs, playback, voiceId = null, onTranscript = null) {
   let result;
   try {
-    result = await executeAutoHandoff(callSession, handoffData.callId, handoffData.args);
+    if (handoffData.earlyDial) {
+      // ✅ 先行発信済み：担当者の電話はアナウンス中から鳴っている。ここでは顧客をConferenceへ移すだけ
+      result = await finishEarlyHandoff(callSession, handoffData.earlyDial);
+    } else {
+      result = await executeAutoHandoff(callSession, handoffData.callId, handoffData.args);
+    }
   } catch (e) {
     console.error('[AutoHandoff] threw:', e?.message || e);
     result = { success: false, message: e?.message || 'handoff threw' };
@@ -306,6 +311,82 @@ async function executeAutoCallEndOnAbsent(callSession, functionCallId, args) {
   } catch (error) {
     console.error('[AutoCallEnd-Absent] エラー:', error);
     return { success: false, message: '切電処理に失敗しました', error: error.message };
+  }
+}
+
+/**
+ * 先行発信：AIが転送を決めた瞬間（受付の「少々お待ちください」直後）に担当者へ発信を始める。
+ * 顧客はアナウンスが流れ終わるまでAIとの通話のまま。戻り値の earlyDial を completeHandoff で使う。
+ */
+function startEarlyHandoffDial(callSession, args) {
+  const earlyDial = {
+    startedAt: Date.now(),
+    user: null,
+    dial: null,
+    redirected: false,
+    cancelled: false,
+    promise: null
+  };
+  earlyDial.promise = (async () => {
+    if (args.customer_consent !== true) {
+      console.log('[EarlyDial] customer_consent is not true — skipping');
+      return { success: false, message: 'consent not given' };
+    }
+    const userId = callSession.assignedAgent;
+    if (!userId) return { success: false, message: 'No assigned agent' };
+    const User = require('../models/User');
+    const user = await User.findById(userId);
+    if (!user) return { success: false, message: 'User not found' };
+    if (!user.handoffPhoneNumber) return { success: false, message: 'No handoff phone number' };
+    earlyDial.user = user;
+
+    const handoffController = require('./handoffController');
+    const dial = await handoffController.dialAgentForHandoff(callSession, user, 'ai-auto');
+    earlyDial.dial = dial;
+    console.log(`[EarlyDial] agent call started ${dial.agentCallSid} (+${Date.now() - earlyDial.startedAt}ms after decision)`);
+
+    // 発信が終わる前に取り消し（受付の言い直し・顧客の切断）が入っていたら、ここで切る
+    if (earlyDial.cancelled) {
+      await handoffController.cancelAgentDial(dial.callId, dial.agentCallSid, 'cancelled while dialing');
+      return { success: false, message: 'cancelled' };
+    }
+    return { success: true, dial };
+  })().catch(err => {
+    console.error('[EarlyDial] dial failed:', err.message);
+    return { success: false, message: err.message };
+  });
+  return earlyDial;
+}
+
+/** 先行発信を取り消す（発信中・発信後どちらでも可） */
+function cancelEarlyHandoffDial(earlyDial, reason) {
+  if (!earlyDial || earlyDial.cancelled || earlyDial.redirected) return Promise.resolve();
+  earlyDial.cancelled = true;
+  console.log('[EarlyDial] cancelling reason=' + reason);
+  if (earlyDial.dial) {
+    const handoffController = require('./handoffController');
+    return handoffController.cancelAgentDial(earlyDial.dial.callId, earlyDial.dial.agentCallSid, reason);
+  }
+  // まだ発信中なら startEarlyHandoffDial 側が発信完了後に切る
+  return earlyDial.promise.then(() => {});
+}
+
+/** アナウンス終了後：先行発信の結果を待って、顧客をConferenceへ移す */
+async function finishEarlyHandoff(callSession, earlyDial) {
+  const dialResult = await earlyDial.promise;
+  if (!dialResult || !dialResult.success || earlyDial.cancelled) {
+    return { success: false, message: (dialResult && dialResult.message) || 'early dial failed' };
+  }
+  const handoffController = require('./handoffController');
+  earlyDial.redirected = true; // これ以降のMedia Stream切断は正常な転送によるもの
+  try {
+    const result = await handoffController.moveCustomerToConference(callSession, earlyDial.user, dialResult.dial);
+    console.log(`[EarlyDial] customer moved to conference (+${Date.now() - earlyDial.startedAt}ms after decision)`);
+    return { success: true, message: '担当者への転送を開始しました', handoffCallSid: result.handoffCallSid };
+  } catch (err) {
+    earlyDial.redirected = false;
+    await cancelEarlyHandoffDial(earlyDial, 'redirect failed');
+    return { success: false, message: err.message };
   }
 }
 
@@ -1052,6 +1133,7 @@ exports.handleMediaStream = async (twilioWs, req) => {
   }
 
   let pendingHandoff = null;
+  let activeEarlyDial = null;              // 先行発信中の担当者通話（顧客が切った時に取り消すため）
   let handoffAwaitingAnnouncementCtx = false;
   let handoffFallbackTimer = null;
   let scheduledHandoffCtxId = null;
@@ -1141,6 +1223,15 @@ exports.handleMediaStream = async (twilioWs, req) => {
 
   twilioWs.on('close', async () => {
     console.log('[MediaStream] Client disconnected');
+
+    // ✅ 顧客をConferenceへ移す前に通話が切れた（相手が切った等）→ 先行発信した担当者の電話を取り消す
+    if (activeEarlyDial && !activeEarlyDial.redirected && !activeEarlyDial.cancelled) {
+      try {
+        await cancelEarlyHandoffDial(activeEarlyDial, 'customer disconnected before redirect');
+      } catch (err) {
+        console.error('[EarlyDial] cancel on close error:', err.message);
+      }
+    }
 
     if (handoffFallbackTimer) {
       clearTimeout(handoffFallbackTimer);
@@ -1623,6 +1714,11 @@ exports.handleMediaStream = async (twilioWs, req) => {
           if (pendingHandoff) {
             if (!pendingHandoff.ctxId) {
               console.log('[barge-in] dropping pendingHandoff (announcement not started)');
+              if (pendingHandoff.earlyDial) {
+                cancelEarlyHandoffDial(pendingHandoff.earlyDial, 'barge-in before announcement')
+                  .catch(err => console.error('[EarlyDial] cancel error:', err.message));
+                activeEarlyDial = null;
+              }
               pendingHandoff = null;
               handoffAwaitingAnnouncementCtx = false;
               if (handoffFallbackTimer) {
@@ -1818,10 +1914,16 @@ exports.handleMediaStream = async (twilioWs, req) => {
 
             try {
               const args = JSON.parse(item.arguments);
+              // ✅ 先行発信：アナウンスの再生完了を待たず、この時点で担当者の電話を鳴らし始める
+              //    （同じ通話で2回目の関数呼び出しが来ても、発信は1回だけにする）
+              if (!activeEarlyDial || activeEarlyDial.cancelled) {
+                activeEarlyDial = startEarlyHandoffDial(callSession, args);
+              }
               pendingHandoff = {
                 callId: item.call_id,
                 args: args,
-                ctxId: null
+                ctxId: null,
+                earlyDial: activeEarlyDial
               };
               handoffAwaitingAnnouncementCtx = true;
               handoffAnnouncementRequested = false;
@@ -1986,5 +2088,8 @@ exports.executeAutoCallEnd = executeAutoCallEnd;
 exports.executeAutoCallEndOnNoResponse = executeAutoCallEndOnNoResponse;
 exports.executeAutoCallEndOnAbsent = executeAutoCallEndOnAbsent;
 exports.executeAutoHandoff = executeAutoHandoff;
+exports.startEarlyHandoffDial = startEarlyHandoffDial;
+exports.cancelEarlyHandoffDial = cancelEarlyHandoffDial;
+exports.finishEarlyHandoff = finishEarlyHandoff;
 
 module.exports = exports;
