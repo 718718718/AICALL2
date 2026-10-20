@@ -556,7 +556,8 @@ async function suiteHandoffControllerBaseUrl() {
     assert.deepStrictEqual(offenders, [], 'no bare process.env.BASE_URL references');
 
     const helperHits = (src.match(/getPublicBaseUrl\(\)/g) || []).length;
-    assert.ok(helperHits >= 10, `expected ≥10 getPublicBaseUrl() callsites, got ${helperHits}`);
+    // 10/20: 使われていないCoeFont用TwiML分岐を削除したため下限を8に変更
+    assert.ok(helperHits >= 8, `expected ≥8 getPublicBaseUrl() callsites, got ${helperHits}`);
   });
 
   // Behavioral: with BASE_URL_PROD only, helper must return that URL
