@@ -5,7 +5,7 @@ mongoose.connect('mongodb://localhost:27017/ai-call-system').then(async () => {
   
   // 定義されているステータス
   const validStatus = ['initiating', 'calling', 'initiated', 'ai-responding', 'transferring', 'human-connected', 'completed', 'failed', 'cancelled', 'in-progress', 'queued'];
-  const validCallResult = ['成功', '不在', '拒否', '要フォロー', '失敗'];
+  const validCallResult = ['成功', '不在', '担当者不在', '拒否', '要フォロー', '失敗'];
   
   // CallSessionのステータスを集計
   const statusStats = await db.collection('callsessions').aggregate([

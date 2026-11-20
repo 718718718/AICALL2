@@ -1,0 +1,2130 @@
+/**
+ * Media Streams Controller for OpenAI Realtime API Integration
+ * Based on: https://github.com/twilio-samples/speech-assistant-openai-realtime-api-python
+ *
+ * This controller bridges Twilio Media Streams and OpenAI Realtime API via WebSocket
+ */
+
+const WebSocket = require('ws');
+const CallSession = require('../models/CallSession');
+const AgentSettings = require('../models/AgentSettings');
+const { buildOpenAIInstructions } = require('../utils/promptBuilder');
+
+const CARTESIA_VOICE_ID_DEFAULT = process.env.CARTESIA_VOICE_ID || 'fd1ee8f5-223a-4a87-a2fe-37eb3706cd69';
+const CARTESIA_MODEL_ID = process.env.CARTESIA_MODEL_ID || 'sonic-3';
+const CARTESIA_API_VERSION = process.env.CARTESIA_API_VERSION || '2026-03-01';
+
+const CARTESIA_TAIL_MS = parseInt(process.env.CARTESIA_TAIL_MS || '1500', 10);
+const CARTESIA_DRAIN_TIMEOUT_MS = parseInt(process.env.CARTESIA_DRAIN_TIMEOUT_MS || '15000', 10);
+
+const HANDOFF_ANNOUNCE_FALLBACK_MS = parseInt(process.env.HANDOFF_ANNOUNCE_FALLBACK_MS || '8000', 10);
+
+const inflightAutoHandoffs = new Set();
+
+const CLOSING_PHRASES = {
+  rejection: '承知いたしました。お忙しいところ恐れ入ります。それでは失礼いたします。',
+  absent: 'ありがとうございます。それでは、また改めてご連絡いたします。お忙しいところ恐れ入ります。失礼いたします。',
+  no_response: '承知いたしました。また改めてご連絡いたします。お忙しいところ恐れ入ります。それでは失礼いたします。',
+  voicemail: null,
+  handoff_fallback: '申し訳ございません。担当者が応答できませんでした。改めてご連絡いたします。それでは失礼いたします。'
+};
+exports.CLOSING_PHRASES = CLOSING_PHRASES;
+
+let closingCounter = 0;
+function nextClosingCtxId(tag) {
+  closingCounter += 1;
+  return `closing-${tag}-${Date.now()}-${closingCounter}`;
+}
+
+function handleDeterministicCallEnd({ endType, phrase, item, openaiWs, cartesiaWs, playback, executor, voiceId = null, onTranscript = null }) {
+  let args = {};
+  try {
+    args = JSON.parse(item.arguments || '{}');
+  } catch (e) {
+    console.error('[FunctionCall] Error parsing arguments:', e.message);
+  }
+
+  if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+    try {
+      openaiWs.send(JSON.stringify({
+        type: 'conversation.item.create',
+        item: {
+          type: 'function_call_output',
+          call_id: item.call_id,
+          output: JSON.stringify({
+            success: true,
+            message: '通話を丁寧に終了します。(deterministic closing)'
+          })
+        }
+      }));
+    } catch (e) {
+      console.error('[FunctionCall] function_call_output send error:', e.message);
+    }
+  }
+
+  if (!phrase) {
+    console.log('[AutoCallEnd] ' + endType + ' silent close — no phrase');
+    playback.invalidateAll(endType + '_silent');
+    setTimeout(() => {
+      console.log('[AutoCallEnd] ' + endType + ' tail elapsed — executing hangup');
+      Promise.resolve(executor(item.call_id, args))
+        .catch(err => console.error('[AutoCallEnd] executor error:', err));
+    }, CARTESIA_TAIL_MS);
+    return null;
+  }
+
+  const ctxId = nextClosingCtxId(endType);
+  playback.startContext(ctxId);
+
+  // ✅ voiceId を渡す（渡さないとデフォルト女性声になる）
+  sendToCartesia(cartesiaWs, phrase, ctxId, true, voiceId);
+  sendToCartesia(cartesiaWs, '', ctxId, false);
+
+  // ✅ closing phraseをフロントエンドの会話内容に表示
+  if (onTranscript) {
+    try { onTranscript(phrase); } catch (e) {}
+  }
+
+  playback.scheduleHangupOnDrain(ctxId, () => {
+    console.log('[AutoCallEnd] ' + endType + ' audio drained — executing hangup');
+    Promise.resolve(executor(item.call_id, args))
+      .catch(err => console.error('[AutoCallEnd] executor error:', err));
+  });
+
+  return ctxId;
+}
+
+async function executeHandoffWithFallback(callSession, handoffData, twilioWs, getStreamSid, cartesiaWs, playback, voiceId = null, onTranscript = null) {
+  let result;
+  try {
+    if (handoffData.earlyDial) {
+      // ✅ 先行発信済み：担当者の電話はアナウンス中から鳴っている。ここでは顧客をConferenceへ移すだけ
+      result = await finishEarlyHandoff(callSession, handoffData.earlyDial);
+    } else {
+      result = await executeAutoHandoff(callSession, handoffData.callId, handoffData.args);
+    }
+  } catch (e) {
+    console.error('[AutoHandoff] threw:', e?.message || e);
+    result = { success: false, message: e?.message || 'handoff threw' };
+  }
+
+  if (result && result.success) return result;
+
+  console.warn('[AutoHandoff] failed — playing fallback closing phrase');
+  const ctxId = nextClosingCtxId('handoff-fallback');
+  playback.startContext(ctxId);
+  if (CLOSING_PHRASES.handoff_fallback) {
+    sendToCartesia(cartesiaWs, CLOSING_PHRASES.handoff_fallback, ctxId, true, voiceId);
+    if (onTranscript) { try { onTranscript(CLOSING_PHRASES.handoff_fallback); } catch (e) {} }
+  }
+  sendToCartesia(cartesiaWs, '', ctxId, false);
+  playback.scheduleHangupOnDrain(ctxId, () => {
+    console.log('[AutoHandoff] fallback closing drained — hanging up');
+    executeAutoCallEnd(callSession, handoffData.callId, {
+      rejection_reason: '担当者転送失敗のため終話',
+    }).catch(err => console.error('[AutoHandoff fallback] executor error:', err));
+  });
+  return result;
+}
+exports.handleDeterministicCallEnd = handleDeterministicCallEnd;
+exports.executeHandoffWithFallback = executeHandoffWithFallback;
+
+const LOG_EVENT_TYPES = [
+  'error',
+  'response.content.done',
+  'rate_limits.updated',
+  'response.done',
+  'input_audio_buffer.committed',
+  'input_audio_buffer.speech_stopped',
+  'input_audio_buffer.speech_started',
+  'session.created',
+  'session.updated',
+  'response.output_item.done',
+  'response.function_call_arguments.done',
+  'response.text.delta',
+  'response.text.done',
+  'response.output_text.delta',
+  'response.output_text.done'
+];
+
+async function executeAutoCallEnd(callSession, functionCallId, args) {
+  try {
+    console.log('[AutoCallEnd] 顧客拒否による自動切電を実行');
+    console.log('[AutoCallEnd] CallSession ID:', callSession._id);
+    console.log('[AutoCallEnd] Function Call ID:', functionCallId);
+    console.log('[AutoCallEnd] 拒否理由:', args.rejection_reason);
+
+    let finalCallResult = '拒否';
+    let finalNotes = args.rejection_reason ? `AI判断による切電: ${args.rejection_reason}` : 'AI判断による切電';
+
+    const absentKeywords = [
+      '不在', '外出', '外出中',
+      '席を外して', '席を外しております', '席を外してい',
+      '会議中', '会議に', '会議で',
+      '休み', '本日休', 'お休み', 'お休みを',
+      '戻り', 'ただいま外',
+      '退職', '離席',
+      'いません', 'おりません', 'ございません',
+      'でかけています', 'でかけております',
+      '手が離せ', '対応できません', '出張'
+    ];
+
+    const reasonText = args.rejection_reason || '';
+    let absentDetected = absentKeywords.some(keyword => reasonText.includes(keyword));
+
+    if (!absentDetected && callSession.transcript && Array.isArray(callSession.transcript)) {
+      const allCustomerMessages = callSession.transcript
+        .filter(t => t.speaker === 'customer')
+        .map(t => t.message || '')
+        .join(' ');
+
+      absentDetected = absentKeywords.some(keyword => allCustomerMessages.includes(keyword));
+
+      if (absentDetected) {
+        console.log('[AutoCallEnd] ⚠️ 会話履歴から不在キーワードを検出');
+      }
+    }
+
+    if (absentDetected) {
+      // 受付（人間）が出て担当者不在を告げたケース。電話に出なかった「不在」とは分けて記録する
+      console.log('[AutoCallEnd] ⚠️ 不在キーワード検出 - ステータスを「担当者不在」に変更します');
+      finalCallResult = '担当者不在';
+      finalNotes = 'AI判断による切電: 担当者不在';
+    }
+
+    callSession.status = 'completed';
+    callSession.endTime = new Date();
+    callSession.callResult = finalCallResult;
+    callSession.endReason = 'ai_initiated';
+    callSession.notes = finalNotes;
+
+    await callSession.save();
+    console.log('[AutoCallEnd] CallSession更新完了');
+
+    if (callSession.twilioCallSid && callSession.twilioCallSid !== 'pending') {
+      const twilioService = require('../services/twilioService');
+      await twilioService.endCall(callSession.twilioCallSid);
+      console.log('[AutoCallEnd] Twilio通話終了完了:', callSession.twilioCallSid);
+    }
+
+    if (global.io && callSession.userId) {
+      const eventData = {
+        customerId: callSession.customerId?.toString() || callSession.customerId,
+        phoneNumber: callSession.phoneNumber,
+        status: 'completed',
+        callResult: finalCallResult,
+        callId: callSession._id.toString(),
+        twilioCallSid: callSession.twilioCallSid
+      };
+      global.io.to(`user-${callSession.userId}`).emit('callStatusUpdate', eventData);
+      console.log(`[WebSocket] Emitted callStatusUpdate to user ${callSession.userId}: completed (${finalCallResult})`, JSON.stringify(eventData));
+    }
+
+    return { success: true, message: '通話を終了しました' };
+
+  } catch (error) {
+    console.error('[AutoCallEnd] エラー:', error);
+    return { success: false, message: '切電処理に失敗しました', error: error.message };
+  }
+}
+
+async function executeAutoCallEndOnNoResponse(callSession, functionCallId, args, type = 'no_response') {
+  try {
+    console.log('[AutoCallEnd-NoResponse] 顧客無応答による自動切電を実行');
+    console.log('[AutoCallEnd-NoResponse] CallSession ID:', callSession._id);
+    console.log('[AutoCallEnd-NoResponse] Function Call ID:', functionCallId);
+
+    callSession.status = 'completed';
+    callSession.endTime = new Date();
+    callSession.callResult = '不在';
+    callSession.endReason = 'ai_initiated';
+    callSession.notes = type === 'voicemail'
+      ? 'AI判断による切電: 留守番電話/機械応答を検出'
+      : 'AI判断による切電: 顧客が応答しなくなった';
+
+    await callSession.save();
+    console.log('[AutoCallEnd-NoResponse] CallSession更新完了');
+
+    if (callSession.twilioCallSid && callSession.twilioCallSid !== 'pending') {
+      const twilioService = require('../services/twilioService');
+      await twilioService.endCall(callSession.twilioCallSid);
+      console.log('[AutoCallEnd-NoResponse] Twilio通話終了完了:', callSession.twilioCallSid);
+    }
+
+    if (global.io && callSession.userId) {
+      const eventData = {
+        customerId: callSession.customerId?.toString() || callSession.customerId,
+        phoneNumber: callSession.phoneNumber,
+        status: 'completed',
+        callResult: '不在',
+        callId: callSession._id.toString(),
+        twilioCallSid: callSession.twilioCallSid
+      };
+      global.io.to(`user-${callSession.userId}`).emit('callStatusUpdate', eventData);
+      console.log(`[WebSocket] Emitted callStatusUpdate to user ${callSession.userId}: completed (不在)`, JSON.stringify(eventData));
+    }
+
+    return { success: true, message: '通話を終了しました' };
+
+  } catch (error) {
+    console.error('[AutoCallEnd-NoResponse] エラー:', error);
+    return { success: false, message: '切電処理に失敗しました', error: error.message };
+  }
+}
+
+async function executeAutoCallEndOnAbsent(callSession, functionCallId, args) {
+  try {
+    console.log('[AutoCallEnd-Absent] 担当者不在による自動切電を実行');
+    console.log('[AutoCallEnd-Absent] CallSession ID:', callSession._id);
+    console.log('[AutoCallEnd-Absent] Function Call ID:', functionCallId);
+    console.log('[AutoCallEnd-Absent] 不在理由:', args.absent_reason);
+    console.log('[AutoCallEnd-Absent] 戻り時間:', args.return_time, '/ 担当者:', args.contact_department, args.contact_name);
+
+    // AIが聞き取った内容を整形（空欄・「不明」は未取得として扱う）
+    const clean = (v) => (typeof v === 'string' ? v.trim().slice(0, 100) : '');
+    const isKnown = (v) => v && v !== '不明';
+    const reason = clean(args.absent_reason) || '不明';
+    const returnTime = clean(args.return_time);
+    const contactName = clean(args.contact_name);
+    const contactDepartment = clean(args.contact_department);
+
+    const noteParts = [`担当者不在（${reason}）`];
+    if (isKnown(returnTime)) noteParts.push(`戻り: ${returnTime}`);
+    const contactLabel = [isKnown(contactDepartment) ? contactDepartment : '', isKnown(contactName) ? contactName : '']
+      .filter(Boolean).join(' ');
+    if (contactLabel) noteParts.push(`担当者: ${contactLabel}`);
+
+    callSession.status = 'completed';
+    callSession.endTime = new Date();
+    callSession.callResult = '担当者不在';
+    callSession.endReason = 'ai_initiated';
+    callSession.notes = `AI判断による切電: ${noteParts.join(' / ')}`;
+    callSession.absentInfo = {
+      reason,
+      returnTime: isKnown(returnTime) ? returnTime : '',
+      contactName: isKnown(contactName) ? contactName : '',
+      contactDepartment: isKnown(contactDepartment) ? contactDepartment : '',
+      recordedAt: new Date()
+    };
+
+    await callSession.save();
+    console.log('[AutoCallEnd-Absent] CallSession更新完了');
+
+    if (callSession.twilioCallSid && callSession.twilioCallSid !== 'pending') {
+      const twilioService = require('../services/twilioService');
+      await twilioService.endCall(callSession.twilioCallSid);
+      console.log('[AutoCallEnd-Absent] Twilio通話終了完了:', callSession.twilioCallSid);
+    }
+
+    if (global.io && callSession.userId) {
+      const eventData = {
+        customerId: callSession.customerId?.toString() || callSession.customerId,
+        phoneNumber: callSession.phoneNumber,
+        status: 'completed',
+        callResult: '担当者不在',
+        callId: callSession._id.toString(),
+        twilioCallSid: callSession.twilioCallSid
+      };
+      global.io.to(`user-${callSession.userId}`).emit('callStatusUpdate', eventData);
+      console.log(`[WebSocket] Emitted callStatusUpdate to user ${callSession.userId}: completed (担当者不在)`, JSON.stringify(eventData));
+    }
+
+    return { success: true, message: '通話を終了しました' };
+
+  } catch (error) {
+    console.error('[AutoCallEnd-Absent] エラー:', error);
+    return { success: false, message: '切電処理に失敗しました', error: error.message };
+  }
+}
+
+/**
+ * 先行発信：AIが転送を決めた瞬間（受付の「少々お待ちください」直後）に担当者へ発信を始める。
+ * 顧客はアナウンスが流れ終わるまでAIとの通話のまま。戻り値の earlyDial を completeHandoff で使う。
+ */
+function startEarlyHandoffDial(callSession, args) {
+  const earlyDial = {
+    startedAt: Date.now(),
+    user: null,
+    dial: null,
+    redirected: false,
+    cancelled: false,
+    promise: null
+  };
+  earlyDial.promise = (async () => {
+    if (args.customer_consent !== true) {
+      console.log('[EarlyDial] customer_consent is not true — skipping');
+      return { success: false, message: 'consent not given' };
+    }
+    const userId = callSession.assignedAgent;
+    if (!userId) return { success: false, message: 'No assigned agent' };
+    const User = require('../models/User');
+    const user = await User.findById(userId);
+    if (!user) return { success: false, message: 'User not found' };
+    if (!user.handoffPhoneNumber) return { success: false, message: 'No handoff phone number' };
+    earlyDial.user = user;
+
+    const handoffController = require('./handoffController');
+    const dial = await handoffController.dialAgentForHandoff(callSession, user, 'ai-auto');
+    earlyDial.dial = dial;
+    console.log(`[EarlyDial] agent call started ${dial.agentCallSid} (+${Date.now() - earlyDial.startedAt}ms after decision)`);
+
+    // 発信が終わる前に取り消し（受付の言い直し・顧客の切断）が入っていたら、ここで切る
+    if (earlyDial.cancelled) {
+      await handoffController.cancelAgentDial(dial.callId, dial.agentCallSid, 'cancelled while dialing');
+      return { success: false, message: 'cancelled' };
+    }
+    return { success: true, dial };
+  })().catch(err => {
+    console.error('[EarlyDial] dial failed:', err.message);
+    return { success: false, message: err.message };
+  });
+  return earlyDial;
+}
+
+/** 先行発信を取り消す（発信中・発信後どちらでも可） */
+function cancelEarlyHandoffDial(earlyDial, reason) {
+  if (!earlyDial || earlyDial.cancelled || earlyDial.redirected) return Promise.resolve();
+  earlyDial.cancelled = true;
+  console.log('[EarlyDial] cancelling reason=' + reason);
+  if (earlyDial.dial) {
+    const handoffController = require('./handoffController');
+    return handoffController.cancelAgentDial(earlyDial.dial.callId, earlyDial.dial.agentCallSid, reason);
+  }
+  // まだ発信中なら startEarlyHandoffDial 側が発信完了後に切る
+  return earlyDial.promise.then(() => {});
+}
+
+/** アナウンス終了後：先行発信の結果を待って、顧客をConferenceへ移す */
+async function finishEarlyHandoff(callSession, earlyDial) {
+  const dialResult = await earlyDial.promise;
+  if (!dialResult || !dialResult.success || earlyDial.cancelled) {
+    return { success: false, message: (dialResult && dialResult.message) || 'early dial failed' };
+  }
+  const handoffController = require('./handoffController');
+  earlyDial.redirected = true; // これ以降のMedia Stream切断は正常な転送によるもの
+  try {
+    const result = await handoffController.moveCustomerToConference(callSession, earlyDial.user, dialResult.dial);
+    console.log(`[EarlyDial] customer moved to conference (+${Date.now() - earlyDial.startedAt}ms after decision)`);
+    return { success: true, message: '担当者への転送を開始しました', handoffCallSid: result.handoffCallSid };
+  } catch (err) {
+    earlyDial.redirected = false;
+    await cancelEarlyHandoffDial(earlyDial, 'redirect failed');
+    return { success: false, message: err.message };
+  }
+}
+
+async function executeAutoHandoff(callSession, functionCallId, args) {
+  const handoffKey = String(callSession._id);
+  if (inflightAutoHandoffs.has(handoffKey)) {
+    console.log('[AutoHandoff] Handoff already in progress for this call — skipping duplicate');
+    return { success: true, message: '転送は既に進行中です', alreadyInProgress: true };
+  }
+  inflightAutoHandoffs.add(handoffKey);
+  try {
+    console.log('[AutoHandoff] Executing automatic handoff');
+    console.log('[AutoHandoff] CallSession ID:', callSession._id);
+    console.log('[AutoHandoff] Function Call ID:', functionCallId);
+    console.log('[AutoHandoff] Arguments:', args);
+
+    if (args.customer_consent !== true) {
+      console.log('[AutoHandoff] Customer did not consent, skipping handoff');
+      return;
+    }
+
+    const userId = callSession.assignedAgent;
+    if (!userId) {
+      console.error('[AutoHandoff] No assigned agent for this call session');
+      return;
+    }
+
+    const User = require('../models/User');
+    const user = await User.findById(userId);
+
+    if (!user) {
+      console.error('[AutoHandoff] User not found:', userId);
+      return;
+    }
+
+    if (!user.handoffPhoneNumber) {
+      console.error('[AutoHandoff] No handoff phone number configured for user:', userId);
+      return;
+    }
+
+    console.log('[AutoHandoff] User found:', user.email);
+    console.log('[AutoHandoff] Handoff phone:', user.handoffPhoneNumber);
+
+    const handoffController = require('./handoffController');
+
+    const result = await handoffController.executeHandoffLogic(
+      callSession,
+      user,
+      'ai-auto',
+      args.reason || '顧客の承諾'
+    );
+
+    console.log('[AutoHandoff] Handoff executed successfully:', result);
+
+    return {
+      success: true,
+      message: '担当者への転送を開始しました',
+      handoffCallSid: result.handoffCallSid
+    };
+
+  } catch (error) {
+    console.error('[AutoHandoff] Error executing handoff:', error);
+    return {
+      success: false,
+      message: '転送に失敗しました。申し訳ございません。',
+      error: error.message
+    };
+  } finally {
+    inflightAutoHandoffs.delete(handoffKey);
+  }
+}
+
+function extractTextFromContent(content) {
+  if (!content || !Array.isArray(content)) return '';
+
+  const textParts = content
+    .filter(item => {
+      return item.type === 'text' ||
+        item.type === 'input_text' ||
+        item.type === 'output_text' ||
+        item.type === 'output_audio' ||
+        item.type === 'audio';
+    })
+    .map(item => item.transcript || item.text || '')
+    .filter(text => text.length > 0);
+
+  return textParts.join(' ').trim();
+}
+
+function sendConversationUpdate(callSession, role, text, timestamp = new Date()) {
+  if (!text || !global.io) return;
+
+  const speaker = role === 'assistant' ? 'ai' : role === 'user' ? 'customer' : 'system';
+  const phoneNumber = callSession.phoneNumber;
+  if (!callSession.transcript) {
+    callSession.transcript = [];
+  }
+  callSession.transcript.push({ speaker, message: text, timestamp });
+  console.log('[Conversation] Stored in memory:', {
+    callId: callSession._id.toString(),
+    speaker,
+    transcriptLength: callSession.transcript.length
+  });
+
+  if (global.io && callSession.userId) {
+    global.io.to(`user-${callSession.userId}`).emit('transcript-update', {
+      callId: callSession._id.toString(),
+      callSid: callSession.twilioCallSid,
+      phoneNumber,
+      speaker,
+      text,
+      message: text,
+      timestamp
+    });
+    console.log(`[WebSocket] Emitted transcript-update to user ${callSession.userId}`);
+  }
+
+  console.log('[Conversation] Sent WebSocket update:', {
+    callId: callSession._id.toString(),
+    speaker,
+    textLength: text.length
+  });
+}
+
+async function initializeSession(openaiWs, agentSettings) {
+  let instructions;
+  try {
+    instructions = buildOpenAIInstructions(agentSettings);
+    console.log('[OpenAI] ✅ instructions生成成功');
+    console.log('[OpenAI] instructions長さ:', instructions.length);
+    console.log('[OpenAI] instructions冒頭200文字:', instructions.substring(0, 200));
+    console.log('[OpenAI] 会社名チェック:', instructions.includes(agentSettings.conversationSettings.companyName) ? '✅含まれる' : '❌含まれない');
+    console.log('[OpenAI] サービス名チェック:', instructions.includes(agentSettings.conversationSettings.serviceName) ? '✅含まれる' : '❌含まれない');
+  } catch (error) {
+    console.error('[OpenAI] ❌ instructions生成失敗:', error);
+    instructions = "You are a helpful AI assistant for making business calls.";
+  }
+
+  const temperature = agentSettings?.temperature || 0.8;
+
+  const sessionUpdate = {
+    type: "session.update",
+    session: {
+      type: "realtime",
+      model: "gpt-realtime",
+      output_modalities: ["text"],
+      audio: {
+        input: {
+          format: { type: "audio/pcmu" },
+          noise_reduction: { type: "near_field" },
+          turn_detection: {
+            type: "server_vad",
+            threshold: 0.4,        // 0.2は低すぎてエコー・ノイズで誤発火する
+            prefix_padding_ms: 300,
+            silence_duration_ms: 600,  // 短すぎると発話途中で切れる
+            interrupt_response: false  // 割り込み（応答の中断）はアプリ側のbarge-in処理で判断する
+          },
+          transcription: {
+            model: "gpt-4o-transcribe",
+            language: "ja"
+          }
+        }
+      },
+      instructions: instructions,
+      tools: [
+        {
+          type: "function",
+          name: "transfer_to_human",
+          description: "人間の営業担当に電話転送する。次のいずれかに当てはまったら、転送アナウンスと同じターンで即座に呼び出す（顧客の同意確認は不要）：⓪受付が担当者への取次を始めた（「担当者に代わります」「おつなぎします」「少々お待ちください」）→担当者が出るのを待たずに呼ぶ ①内線取次の後に担当者が電話口に出た（「お電話代わりました」「担当の○○です」）②相手が担当者だと名乗った（「担当者は私です」）③相手が用件を引き受けた（「私が伺います」「私が承ります」）。受付が名乗らずに用件を聞いただけの場合や、相手が断った場合は呼び出さない。",
+          parameters: {
+            type: "object",
+            properties: {
+              customer_consent: {
+                type: "boolean",
+                description: "上記⓪〜③の転送条件を満たしているか（true=満たしている）。受付が用件を聞いただけ、または相手が断った場合はfalse"
+              },
+              reason: {
+                type: "string",
+                description: "転送理由（例：詳細説明希望、価格質問、技術的質問、担当者希望）",
+                enum: ["詳細説明希望", "価格質問", "技術的質問", "担当者希望", "その他"]
+              }
+            },
+            required: ["customer_consent"]
+          }
+        },
+        {
+          type: "function",
+          name: "end_call_on_rejection",
+          description: "顧客が明確に興味がないと表明し、会話の継続を拒否した時に使用する。「結構です」「必要ありません」「忙しいので」「間に合っています」などの明確な拒否表現を検知した時のみ呼び出す。重要：顧客が明確に拒否した時のみ使用すること。",
+          parameters: {
+            type: "object",
+            properties: {
+              rejection_reason: {
+                type: "string",
+                description: "顧客の拒否理由カテゴリ",
+                enum: ["興味なし", "忙しい", "既存サービス利用中", "不要", "その他"]
+              }
+            },
+            required: ["rejection_reason"]
+          }
+        },
+        {
+          type: "function",
+          name: "end_call_on_voicemail",
+          description: "留守番電話に転送されたことを検知した時に使用する。「留守番電話に転送されました」「発信音の後で」「メッセージを録音」などのキーワードを検知した時、または機械的な音声アナウンスを検知した時に即座に呼び出す。メッセージを残さずに通話を終了する。",
+          parameters: {
+            type: "object",
+            properties: {
+              voicemail_detected: {
+                type: "boolean",
+                description: "留守番電話が検出されたか"
+              }
+            },
+            required: ["voicemail_detected"]
+          }
+        },
+        {
+          type: "function",
+          name: "end_call_on_no_response",
+          description: "顧客が長時間応答しなくなった場合、最後の確認後に通話を終了する時に使用する。システムから「顧客が応答しません」というメッセージを受け取り、2回確認しても応答がない場合に呼び出す。",
+          parameters: {
+            type: "object",
+            properties: {
+              no_response_confirmed: {
+                type: "boolean",
+                description: "顧客の無応答を確認したか"
+              }
+            },
+            required: ["no_response_confirmed"]
+          }
+        },
+        {
+          type: "function",
+          name: "end_call_on_absent",
+          description: "受付から担当者が不在・外出・会議中・休暇・退職などで電話に出られないと告げられた時に使う（end_call_on_rejectionではなく必ずこの関数）。該当する言葉：「席を外しております」「外出しております」「外出中です」「会議中です」「本日は休みです」「お休みをいただいております」「退職しました」「おりません」「でかけております」「出張中」「手が離せません」。重要：不在を告げられた直後には呼ばない。まず戻り時間（休みなら次の出社日）を1回、次に担当者のお名前を1回伺い、相手が答え終わってから、聞き取った内容を引数に入れて呼ぶ。相手が答えない・断った場合は重ねて聞かずに呼ぶ。退職の場合は何も聞かずにすぐ呼ぶ。終話の挨拶はシステムが流すので、呼ぶ前に自分で挨拶しない。",
+          parameters: {
+            type: "object",
+            properties: {
+              absent_reason: {
+                type: "string",
+                description: "不在の理由カテゴリ",
+                enum: ["外出中", "会議中", "休暇中", "退職済", "不明", "その他"]
+              },
+              return_time: {
+                type: "string",
+                description: "相手が答えた戻り時間・次の出社予定をそのまま記録（例：「15時頃」「夕方」「本日は戻らない」「明日」）。聞けなかった場合は「不明」"
+              },
+              contact_name: {
+                type: "string",
+                description: "相手が答えた担当者の名前（例：「山田様」）。教えてもらえなかった場合は「不明」"
+              },
+              contact_department: {
+                type: "string",
+                description: "担当者の部署名がわかれば記録（例：「営業部」）。わからなければ空欄"
+              }
+            },
+            required: ["absent_reason", "return_time", "contact_name"]
+          }
+        }
+      ],
+      tool_choice: "auto"
+    }
+  };
+
+  console.log('[OpenAI] Sending session update with instructions preview:',
+    instructions.substring(0, 200) + '...');
+  openaiWs.send(JSON.stringify(sessionUpdate));
+}
+
+function sendChunkMark(twilioWs, streamSid, markName, markQueue = null) {
+  if (!streamSid) {
+    console.warn('[Mark] Skipped: streamSid is null');
+    return false;
+  }
+  if (!twilioWs || twilioWs.readyState !== WebSocket.OPEN) {
+    console.error('[Mark] ERROR: Twilio WebSocket not open. State:', twilioWs?.readyState);
+    return false;
+  }
+  try {
+    twilioWs.send(JSON.stringify({
+      event: 'mark',
+      streamSid,
+      mark: { name: markName }
+    }));
+    if (Array.isArray(markQueue)) markQueue.push(markName);
+    return true;
+  } catch (error) {
+    console.error('[Mark] ERROR sending mark:', error.message);
+    return false;
+  }
+}
+
+function parseChunkMark(name) {
+  if (typeof name !== 'string' || !name.startsWith('cartesia:')) return null;
+  const parts = name.split(':');
+  if (parts.length !== 3) return null;
+  const seq = parseInt(parts[2], 10);
+  if (Number.isNaN(seq)) return null;
+  return { ctxId: parts[1], seq };
+}
+
+function createCartesiaContextId(responseId, itemId) {
+  return `ctx-${responseId}-${itemId}`;
+}
+
+function createCartesiaWs(twilioWs, getStreamSid, callbacks = {}) {
+  if (!process.env.CARTESIA_API_KEY) {
+    console.error('[Cartesia] CARTESIA_API_KEY is not set');
+    return null;
+  }
+  // ✅ 新しい接続を作る前に古い接続が残っていないか確認
+  console.log('[Cartesia] Creating new WebSocket connection');
+  const url = `wss://api.cartesia.ai/tts/websocket?cartesia_version=${CARTESIA_API_VERSION}`;
+  const ws = new WebSocket(url, {
+    headers: { 'X-API-Key': process.env.CARTESIA_API_KEY }
+  });
+
+  ws.on('open', () => console.log('[Cartesia] Connected'));
+  ws.on('error', (e) => console.error('[Cartesia] Error:', e.message));
+  ws.on('close', (code) => console.log('[Cartesia] Closed, code:', code));
+
+  ws.on('message', (data) => {
+    try {
+      const msg = JSON.parse(data.toString());
+      if (msg.type === 'chunk' && msg.data) {
+        if (callbacks.onChunk) {
+          callbacks.onChunk({ ctxId: msg.context_id, payload: msg.data });
+        } else {
+          const sid = getStreamSid();
+          if (twilioWs && twilioWs.readyState === WebSocket.OPEN && sid) {
+            twilioWs.send(JSON.stringify({
+              event: 'media',
+              streamSid: sid,
+              media: { payload: msg.data }
+            }));
+          }
+        }
+      } else if (msg.type === 'done') {
+        if (callbacks.onContextDone) {
+          callbacks.onContextDone({ ctxId: msg.context_id });
+        }
+      } else if (msg.type === 'error') {
+        console.error('[Cartesia] TTS error:', JSON.stringify(msg));
+        if (callbacks.onError) callbacks.onError(msg);
+      }
+    } catch (e) {
+      console.error('[Cartesia] Parse error:', e.message);
+    }
+  });
+
+  return ws;
+}
+
+exports.parseChunkMark = parseChunkMark;
+exports.sendChunkMark = sendChunkMark;
+exports.createCartesiaContextId = createCartesiaContextId;
+
+function createPlaybackTracker({ tailMs = CARTESIA_TAIL_MS, drainTimeoutMs = CARTESIA_DRAIN_TIMEOUT_MS, logger = console, onDrain = null } = {}) {
+  const contexts = new Map();
+  const markQueue = [];
+  let activeContextId = null;
+  let aiResponseActive = false;
+
+  function getContext(id, { create = false } = {}) {
+    if (!id) return null;
+    let ctx = contexts.get(id);
+    if (!ctx && create) {
+      ctx = {
+        id,
+        marks: 0,
+        chunks: 0,
+        markSeq: 0,
+        doneFromCartesia: false,
+        invalidated: false,
+        pendingHangup: null,
+        terminating: false,
+        pendingHangupTimer: null,
+        drainTimeout: null
+      };
+      contexts.set(id, ctx);
+    }
+    return ctx || null;
+  }
+
+  function startContext(id) {
+    const ctx = getContext(id, { create: true });
+    activeContextId = id;
+    aiResponseActive = true;
+    return ctx;
+  }
+
+  function endContext(id) {
+    const ctx = getContext(id);
+    if (!ctx) return;
+    ctx.doneFromCartesia = true;
+    checkDrain(id);
+  }
+
+  function canAcceptChunk(id) {
+    const ctx = getContext(id);
+    return !!(ctx && !ctx.invalidated);
+  }
+
+  function recordChunk(id) {
+    const ctx = getContext(id);
+    if (!ctx) {
+      logger.log('[Playback] drop chunk (unknown ctx):', id);
+      return null;
+    }
+    if (ctx.invalidated) {
+      logger.log('[barge-in] stale cartesia chunk dropped ctx=' + id);
+      return null;
+    }
+    ctx.chunks += 1;
+    const seq = ctx.markSeq++;
+    ctx.marks += 1;
+    const markName = `cartesia:${id}:${seq}`;
+    markQueue.push(markName);
+    return markName;
+  }
+
+  function rollbackChunk(markName) {
+    const parsed = parseChunkMark(markName);
+    if (!parsed) return;
+    const idx = markQueue.indexOf(markName);
+    if (idx < 0) return;
+    markQueue.splice(idx, 1);
+    const ctx = getContext(parsed.ctxId);
+    if (!ctx) return;
+    if (ctx.marks > 0) ctx.marks -= 1;
+    if (ctx.chunks > 0) ctx.chunks -= 1;
+    checkDrain(parsed.ctxId);
+  }
+
+  function ackMark(markName) {
+    const parsed = parseChunkMark(markName);
+    if (!parsed) {
+      if (markQueue.length > 0) markQueue.shift();
+      return;
+    }
+    const idx = markQueue.indexOf(markName);
+    if (idx >= 0) markQueue.splice(idx, 1);
+
+    const ctx = getContext(parsed.ctxId);
+    if (!ctx) return;
+    ctx.marks = Math.max(0, ctx.marks - 1);
+    checkDrain(parsed.ctxId);
+  }
+
+  function checkDrain(id) {
+    const ctx = getContext(id);
+    if (!ctx) return;
+    if (ctx.marks === 0 && ctx.doneFromCartesia) {
+      if (ctx.drainTimeout) {
+        clearTimeout(ctx.drainTimeout);
+        ctx.drainTimeout = null;
+      }
+      if (activeContextId === id) {
+        aiResponseActive = false;
+        activeContextId = null;
+      }
+      // ✅ Cartesia音声再生が完全に終わったタイミングでコールバック発火
+      if (!ctx.invalidated && !ctx.terminating && onDrain) {
+        try { onDrain(id); } catch (e) { logger.error('[Playback] onDrain error:', e?.message || e); }
+      }
+      firePendingHangup(id);
+    }
+  }
+
+  function firePendingHangup(id) {
+    const ctx = getContext(id);
+    if (!ctx || !ctx.pendingHangup) return;
+    const fn = ctx.pendingHangup;
+    ctx.pendingHangup = null;
+    if (ctx.pendingHangupTimer) {
+      clearTimeout(ctx.pendingHangupTimer);
+      ctx.pendingHangupTimer = null;
+    }
+    ctx.pendingHangupTimer = setTimeout(() => {
+      ctx.pendingHangupTimer = null;
+      try {
+        fn();
+      } catch (e) {
+        logger.error('[Playback] pending hangup error:', e?.message || e);
+      }
+    }, tailMs);
+  }
+
+  function scheduleHangupOnDrain(id, fn) {
+    const ctx = getContext(id, { create: true });
+    if (ctx.pendingHangup) {
+      logger.warn('[Playback] overwriting existing pendingHangup for ctx=' + id);
+    }
+    ctx.pendingHangup = fn;
+    ctx.terminating = true;
+    if (ctx.marks === 0 && ctx.doneFromCartesia) {
+      firePendingHangup(id);
+      return;
+    }
+    if (ctx.drainTimeout) clearTimeout(ctx.drainTimeout);
+    ctx.drainTimeout = setTimeout(() => {
+      logger.warn('[Playback] drain timeout — forcing pending hangup ctx=' + id);
+      ctx.doneFromCartesia = true;
+      ctx.marks = 0;
+      firePendingHangup(id);
+    }, drainTimeoutMs);
+  }
+
+  function cancelScheduledHangup(id) {
+    const ctx = getContext(id);
+    if (!ctx) return false;
+    const hadScheduledHangup = !!(
+      ctx.pendingHangup ||
+      ctx.pendingHangupTimer ||
+      ctx.drainTimeout ||
+      ctx.terminating
+    );
+    if (ctx.pendingHangupTimer) {
+      clearTimeout(ctx.pendingHangupTimer);
+      ctx.pendingHangupTimer = null;
+    }
+    if (ctx.drainTimeout) {
+      clearTimeout(ctx.drainTimeout);
+      ctx.drainTimeout = null;
+    }
+    ctx.pendingHangup = null;
+    ctx.terminating = false;
+    return hadScheduledHangup;
+  }
+
+  function invalidateAll(reason) {
+    const ids = [];
+    const terminatingToFire = [];
+    for (const [id, ctx] of contexts) {
+      if (!ctx.invalidated) {
+        ctx.invalidated = true;
+        ids.push(id);
+        if (ctx.drainTimeout) {
+          clearTimeout(ctx.drainTimeout);
+          ctx.drainTimeout = null;
+        }
+        if (ctx.terminating && ctx.pendingHangup) {
+          if (ctx.pendingHangupTimer) {
+            clearTimeout(ctx.pendingHangupTimer);
+            ctx.pendingHangupTimer = null;
+          }
+          terminatingToFire.push(id);
+        } else if (ctx.terminating && ctx.pendingHangupTimer) {
+          // leave in-flight timer alone
+        } else {
+          if (ctx.pendingHangupTimer) {
+            clearTimeout(ctx.pendingHangupTimer);
+            ctx.pendingHangupTimer = null;
+          }
+          ctx.pendingHangup = null;
+        }
+      }
+    }
+    markQueue.length = 0;
+    aiResponseActive = false;
+    activeContextId = null;
+    logger.log(`[Playback] invalidated ${ids.length} ctx(s) reason=${reason}`);
+    for (const id of terminatingToFire) {
+      const ctx = getContext(id);
+      if (ctx && ctx.pendingHangup) {
+        firePendingHangup(id);
+      }
+    }
+    return ids;
+  }
+
+  return {
+    contexts,
+    markQueue,
+    getActiveContextId: () => activeContextId,
+    isAiResponseActive: () => aiResponseActive,
+    getContextSnapshot: (id) => {
+      const c = contexts.get(id);
+      if (!c) return null;
+      return { marks: c.marks, chunks: c.chunks, doneFromCartesia: c.doneFromCartesia, invalidated: c.invalidated };
+    },
+    startContext,
+    endContext,
+    canAcceptChunk,
+    recordChunk,
+    rollbackChunk,
+    ackMark,
+    scheduleHangupOnDrain,
+    cancelScheduledHangup,
+    invalidateAll
+  };
+}
+
+exports.createPlaybackTracker = createPlaybackTracker;
+
+function sendToCartesia(cartesiaWs, text, contextId, continueFlag = false, voiceId = null, speed = null) {
+  if (continueFlag && (!text || !text.trim())) return;
+
+  const basePayload = {
+    model_id: CARTESIA_MODEL_ID,
+    transcript: (text || '').trim(),
+    voice: { mode: 'id', id: voiceId || CARTESIA_VOICE_ID_DEFAULT },
+    output_format: { container: 'raw', encoding: 'pcm_mulaw', sample_rate: 8000 },
+    context_id: contextId,
+    continue: continueFlag
+  };
+  if (speed !== null) basePayload.speed = speed;
+  const payload = JSON.stringify(basePayload);
+  if (cartesiaWs && cartesiaWs.readyState === WebSocket.OPEN) {
+    console.log('[Cartesia] Sending text (' + text.length + ' chars):', text.substring(0, 80));
+    cartesiaWs.send(payload);
+  } else if (cartesiaWs && cartesiaWs.readyState === WebSocket.CONNECTING) {
+    console.log('[Cartesia] Still connecting, queuing text:', text.substring(0, 50));
+    cartesiaWs.once('open', () => {
+      console.log('[Cartesia] Flushing queued text');
+      cartesiaWs.send(payload);
+    });
+  } else {
+    console.error('[Cartesia] Not connected, skipping:', text.substring(0, 50));
+  }
+}
+
+exports.handleMediaStream = async (twilioWs, req) => {
+  const callId = req.params.callId;
+  console.log('[MediaStream] Client connected, callId:', callId);
+
+  if (!process.env.OPENAI_REALTIME_API_KEY) {
+    console.error('[MediaStream] Missing OpenAI API key');
+    twilioWs.close();
+    return;
+  }
+
+  let streamSid = null;
+  let latestMediaTimestamp = 0;
+  let lastAssistantItem = null;
+  let responseStartTimestamp = null;
+  let openaiWs = null;
+  let cartesiaWs = null;
+  let cartesiaVoiceId = CARTESIA_VOICE_ID_DEFAULT; // ✅ スコープを外に出す（completeHandoffから参照するため）
+  let cartesiaSpeed = null;
+  let textBuffer = '';
+  let pendingBargeIn = false;         // ✅ 仮バージイン中フラグ（transcription確認待ち）
+  let bargeInSavedText = '';          // バージイン時に中断したAIのテキスト
+  let bargeInSavedCtxId = null;       // バージイン時のcontextId
+  let currentResponseId = null;
+  let cartesiaContextId = null;
+  let textDeltaEventType = null;
+  let hasGreeted = false;      // AIから先に第一声（開始挨拶）を出したか
+  let sessionIsReady = false;  // session.updated（設定反映）を受信済みか
+　let pendingAudioChunks = []; // セッション準備前に届いた音声を退避（最初の発話を守る）
+  
+  // ✅ Cartesia音声再生完了後に沈黙タイマーを開始するコールバック
+  function startSilenceTimerAfterDrain(drainedCtxId) {
+    if (pendingHandoff || pendingCallEnd) return;
+    // ✅ 別の発話がまだ再生中なら、それが終わった時の drain で改めて開始する
+    if (liveContexts(drainedCtxId).length > 0 || cartesiaContextId) {
+      console.log('[SilenceDetection] drain(ctx=' + drainedCtxId + ') だが他の発話が再生中 — タイマー開始を見送り');
+      return;
+    }
+    if (customerSilenceTimer) {
+      clearTimeout(customerSilenceTimer);
+    }
+
+    // ✅ customerSilenceCheckCount === 0 = まだ一度も確認していない = AIが名乗った直後
+    //    この場合は顧客が既に話していても8秒待つ（キャッチボールの間を確保）
+    let timeoutDuration;
+    if (customerSilenceCheckCount === 0) {
+      timeoutDuration = 8000;  // 8秒：AI発話後、顧客の返答を待つ
+    } else {
+      timeoutDuration = 5000;  // 5秒：確認フェーズ（もしもし後）
+    }
+
+    console.log(`[SilenceDetection] Cartesia drain完了(ctx=${drainedCtxId}) → customerHasSpoken=${customerHasSpoken}, タイマー開始 (check ${customerSilenceCheckCount + 1}, ${timeoutDuration}ms)`);
+
+    customerSilenceTimer = setTimeout(() => {
+      if (liveContexts().length > 0 || cartesiaContextId) {
+        console.log('[SilenceDetection] AI発話中のため確認メッセージをスキップ');
+        return;
+      }
+      console.log(`[SilenceDetection] ${timeoutDuration / 1000}秒の沈黙を検知`);
+
+      if (customerSilenceCheckCount === 0) {
+        console.log('[SilenceDetection] Sending first check message');
+        customerSilenceCheckCount = 1;
+
+        if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+          const systemMessage = {
+            type: 'conversation.item.create',
+            item: {
+              type: 'message',
+              role: 'user',
+              content: [{
+                type: 'input_text',
+                text: '[システムメッセージ] 顧客が応答していません。「もしもし、おつながりでしょうか？」と確認してください。'
+              }]
+            }
+          };
+          openaiWs.send(JSON.stringify(systemMessage));
+          openaiWs.send(JSON.stringify({ type: 'response.create' }));
+        }
+      } else if (customerSilenceCheckCount === 1) {
+        console.log('[SilenceDetection] Sending second check message');
+        customerSilenceCheckCount = 2;
+
+        if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+          const systemMessage = {
+            type: 'conversation.item.create',
+            item: {
+              type: 'message',
+              role: 'user',
+              content: [{
+                type: 'input_text',
+                text: '[システムメッセージ] 顧客がまだ応答していません。「恐れ入りますが、お電話つながっておりますでしょうか？」と確認してください。'
+              }]
+            }
+          };
+          openaiWs.send(JSON.stringify(systemMessage));
+          openaiWs.send(JSON.stringify({ type: 'response.create' }));
+        }
+      } else {
+        console.log('[SilenceDetection] Sending final termination message');
+        customerSilenceCheckCount = 0;
+
+        if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+          const systemMessage = {
+            type: 'conversation.item.create',
+            item: {
+              type: 'message',
+              role: 'user',
+              content: [{
+                type: 'input_text',
+                text: '[システムメッセージ] 顧客が応答しません。「お電話が遠いようですので、改めてご連絡させていただきます。失礼いたします」と言って end_call_on_no_response 関数を呼び出して通話を終了してください。'
+              }]
+            }
+          };
+          openaiWs.send(JSON.stringify(systemMessage));
+          openaiWs.send(JSON.stringify({ type: 'response.create' }));
+        }
+      }
+    }, timeoutDuration);
+  }
+
+  const playback = createPlaybackTracker({ onDrain: startSilenceTimerAfterDrain });
+  const markQueue = playback.markQueue;
+
+  // ✅ まだ再生中（または生成中）のCartesia contextを返す
+  function liveContexts(excludeId = null) {
+    return [...playback.contexts.values()].filter(c =>
+      c.id !== excludeId && !c.invalidated && !(c.doneFromCartesia && c.marks === 0));
+  }
+  let suppressedItemId = null; // 重ねて喋らせないことにしたAI発話のitem_id
+  let greetingPending = false;  // 開始挨拶の発話をまだ受け取っていない
+  // ✅ 開始挨拶（保護中）がまだ再生中か
+  function greetingPlaying() {
+    return liveContexts().some(c => c.protectedGreeting);
+  }
+
+  let pendingHandoff = null;
+  let activeEarlyDial = null;              // 先行発信中の担当者通話（顧客が切った時に取り消すため）
+  let handoffAwaitingAnnouncementCtx = false;
+  let handoffFallbackTimer = null;
+  let scheduledHandoffCtxId = null;
+  let handoffCompleted = false;
+  let pendingCallEnd = null;
+  let lastCompletedCtxId = null;
+  let lastCompletedCtxResponseId = null; // lastCompletedCtxId を生んだ response_id（同一ターン判定用）
+  let handoffAnnouncementRequested = false; // アナウンス無しで関数だけ呼ばれた場合に1回だけ response.create する
+  let suppressCancelSent = false;          // 転送確定後の余計なAI発話に response.cancel を送ったか
+
+  let customerSilenceTimer = null;
+  let customerSilenceCheckCount = 0;
+
+  let callSession = null;
+  let speechStartedAt = null;
+
+  // ── フィラー制御用：直前に顧客が話したかどうかのフラグ ──
+  let customerJustSpoke = false;
+  // ── 顧客が一度でも話したかどうかのフラグ（沈黙検知タイマー制御用）──
+  let customerHasSpoken = false;
+
+  function completeHandoff(reason) {
+    if (handoffCompleted) return;
+    handoffCompleted = true;
+
+    if (handoffFallbackTimer) {
+      clearTimeout(handoffFallbackTimer);
+      handoffFallbackTimer = null;
+    }
+
+    const handoffData = pendingHandoff ? { ...pendingHandoff } : null;
+    pendingHandoff = null;
+    handoffAwaitingAnnouncementCtx = false;
+    scheduledHandoffCtxId = null;
+
+    if (!handoffData) return;
+
+    console.log('[AutoHandoff] completing handoff reason=' + reason);
+    executeHandoffWithFallback(callSession, handoffData, twilioWs, () => streamSid, cartesiaWs, playback, cartesiaVoiceId, (text) => sendConversationUpdate(callSession, 'assistant', text))
+      .catch(err => console.error('[AutoHandoff] Error execution:', err));
+  }
+
+  twilioWs.on('message', (message) => {
+    try {
+      const data = JSON.parse(message);
+      console.log('[Twilio→Backend] Received message:', JSON.stringify(data).substring(0, 200), 'callId:', callId);
+      console.log('[Twilio→Backend] Event type:', data.event || 'NO EVENT FIELD');
+
+      if (data.event === 'media') {
+        latestMediaTimestamp = parseInt(data.media.timestamp);
+        if (sessionIsReady && openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+          openaiWs.send(JSON.stringify({
+            type: "input_audio_buffer.append",
+            audio: data.media.payload
+          }));
+        } else {
+          // セッション準備前の音声は退避しておく（上限 約16秒）
+          pendingAudioChunks.push(data.media.payload);
+          if (pendingAudioChunks.length > 800) pendingAudioChunks.shift();
+        }
+      }
+
+      else if (data.event === 'start') {
+        streamSid = data.start.streamSid;
+        console.log('[MediaStream] Stream started:', streamSid);
+        responseStartTimestamp = null;
+        latestMediaTimestamp = 0;
+        lastAssistantItem = null;
+
+        const connection = global.activeMediaStreams.get(callId);
+        if (connection) {
+          connection.streamSid = streamSid;
+          console.log('[MediaStream] Updated streamSid in global map:', callId);
+        }
+        
+      }
+
+      else if (data.event === 'mark') {
+        const markName = data.mark && data.mark.name;
+        playback.ackMark(markName);
+      }
+
+    } catch (error) {
+      console.error('[MediaStream] Error processing Twilio message:', error.message);
+    }
+  });
+
+  twilioWs.on('close', async () => {
+    console.log('[MediaStream] Client disconnected');
+
+    // ✅ 顧客をConferenceへ移す前に通話が切れた（相手が切った等）→ 先行発信した担当者の電話を取り消す
+    if (activeEarlyDial && !activeEarlyDial.redirected && !activeEarlyDial.cancelled) {
+      try {
+        await cancelEarlyHandoffDial(activeEarlyDial, 'customer disconnected before redirect');
+      } catch (err) {
+        console.error('[EarlyDial] cancel on close error:', err.message);
+      }
+    }
+
+    if (handoffFallbackTimer) {
+      clearTimeout(handoffFallbackTimer);
+      handoffFallbackTimer = null;
+    }
+    if (scheduledHandoffCtxId) {
+      playback.cancelScheduledHangup(scheduledHandoffCtxId);
+      scheduledHandoffCtxId = null;
+    }
+    handoffCompleted = true;
+
+    if (global.activeMediaStreams.has(callId)) {
+      global.activeMediaStreams.delete(callId);
+      console.log('[MediaStream] Removed connection from global map:', callId);
+    }
+
+    if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+      openaiWs.close();
+    }
+
+    if (callSession) {
+      const latestSession = await CallSession.findById(callSession._id);
+      const currentStatus = latestSession ? latestSession.status : callSession.status;
+      console.log(`[MediaStream] Current status before disconnect (from DB): ${currentStatus}`);
+      console.log(`[MediaStream] Previous in-memory status was: ${callSession.status}`);
+
+      const isHandoffInProgress =
+        currentStatus === 'transferring' ||
+        currentStatus === 'human-connected' ||
+        latestSession?.handoffDetails?.requestedAt;
+
+      if (isHandoffInProgress) {
+        console.log('[MediaStream] Call is being transferred or in conference - not marking as completed');
+        if (latestSession && callSession.transcript && callSession.transcript.length > 0) {
+          latestSession.transcript = callSession.transcript;
+          await latestSession.save();
+          console.log(`[MediaStream] Transcript saved, status remains: ${currentStatus}`);
+        }
+      } else {
+        callSession.status = 'completed';
+        console.log('[MediaStream] Marking call as completed (non-transfer case)');
+
+        if (callSession.transcript && callSession.transcript.length > 0) {
+          console.log('[MediaStream] Saving transcript to DB:', {
+            callId: callSession._id.toString(),
+            transcriptLength: callSession.transcript.length
+          });
+        }
+
+        await callSession.save();
+        console.log('[MediaStream] CallSession saved with transcript');
+
+        if (global.io && callSession.userId) {
+          const eventData = {
+            customerId: callSession.customerId?.toString() || callSession.customerId,
+            phoneNumber: callSession.phoneNumber,
+            status: 'completed',
+            callResult: callSession.callResult || '完了',
+            callId: callSession._id.toString(),
+            twilioCallSid: callSession.twilioCallSid
+          };
+          global.io.to(`user-${callSession.userId}`).emit('callStatusUpdate', eventData);
+          console.log(`[WebSocket] Emitted callStatusUpdate to user ${callSession.userId}: completed`, JSON.stringify(eventData));
+        }
+      }
+    }
+  });
+
+  twilioWs.on('error', (error) => {
+    console.error('[MediaStream] Twilio WebSocket error:', error.message);
+  });
+
+  try {
+    callSession = await CallSession.findById(callId).populate('assignedAgent');
+
+    if (!callSession) {
+      console.error('[MediaStream] CallSession not found:', callId);
+      twilioWs.close();
+      return;
+    }
+
+    console.log('[MediaStream] CallSession loaded:', callSession._id);
+
+    let agentSettings = null;
+    if (callSession.assignedAgent) {
+      agentSettings = await AgentSettings.findOne({ userId: callSession.assignedAgent._id });
+      console.log('[MediaStream] AgentSettings loaded for user:', callSession.assignedAgent._id);
+      if (agentSettings && agentSettings.conversationSettings) {
+        console.log('[MediaStream] AgentSettings preview:', {
+          companyName: agentSettings.conversationSettings.companyName,
+          serviceName: agentSettings.conversationSettings.serviceName,
+          representativeName: agentSettings.conversationSettings.representativeName
+        });
+      } else {
+        console.warn('[MediaStream] AgentSettings missing conversationSettings!');
+      }
+    }
+
+    const temperature = agentSettings?.temperature || 0.8;
+    cartesiaVoiceId = agentSettings?.cartesiaVoiceId || CARTESIA_VOICE_ID_DEFAULT;
+    const speechRateMap = { slow: 0.8, normal: 1.0, fast: 1.2 };
+    cartesiaSpeed = speechRateMap[agentSettings?.conversationSettings?.speechRate] || null;
+    const openaiUrl = `wss://api.openai.com/v1/realtime?model=gpt-realtime&temperature=${temperature}`;
+    console.log('[OpenAI] Connecting to:', openaiUrl);
+    console.log('[OpenAI] API Key present:', !!process.env.OPENAI_REALTIME_API_KEY);
+
+    openaiWs = new WebSocket(openaiUrl, {
+      headers: {
+        'Authorization': `Bearer ${process.env.OPENAI_REALTIME_API_KEY}`
+      }
+    });
+
+    openaiWs.on('open', async () => {
+      console.log('[OpenAI] Connected to Realtime API');
+
+      await initializeSession(openaiWs, agentSettings);
+      
+      // ✅ 古いCartesia接続が残っていればクローズ
+      if (cartesiaWs && cartesiaWs.readyState === WebSocket.OPEN) {
+        console.log('[Cartesia] Closing stale connection before creating new one');
+        cartesiaWs.close();
+        cartesiaWs = null;
+      }
+
+      cartesiaWs = createCartesiaWs(twilioWs, () => streamSid, {
+        onChunk: ({ ctxId, payload }) => {
+          const sid = streamSid;
+          if (!sid) return;
+          if (!twilioWs || twilioWs.readyState !== WebSocket.OPEN) return;
+          if (!playback.canAcceptChunk(ctxId)) {
+            console.log('[barge-in] stale cartesia chunk dropped ctx=' + ctxId);
+            return;
+          }
+
+          try {
+            twilioWs.send(JSON.stringify({
+              event: 'media',
+              streamSid: sid,
+              media: { payload }
+            }));
+          } catch (e) {
+            console.error('[Cartesia→Twilio] media send error:', e.message);
+            return;
+          }
+
+          const markName = playback.recordChunk(ctxId);
+          if (!markName) return;
+
+          const sent = sendChunkMark(twilioWs, sid, markName);
+          if (!sent) {
+            console.warn('[Cartesia→Twilio] mark send failed, rolling back', markName);
+            playback.rollbackChunk(markName);
+          }
+        },
+        onContextDone: ({ ctxId }) => {
+          console.log('[Cartesia] context done:', ctxId);
+          playback.endContext(ctxId);
+        },
+        onError: (msg) => {
+          console.error('[Cartesia] error event:', msg);
+        }
+      });
+　　　
+      // 以降のライブ音声を受け付けてよい
+      sessionIsReady = true;
+      callSession.realtimeSessionId = 'session-' + Date.now();
+      await callSession.save();
+
+      if (global.io && callSession.userId) {
+        const eventData = {
+          customerId: callSession.customerId?.toString() || callSession.customerId,
+          phoneNumber: callSession.phoneNumber,
+          status: 'calling',
+          callId: callSession._id.toString(),
+          twilioCallSid: callSession.twilioCallSid
+        };
+        global.io.to(`user-${callSession.userId}`).emit('callStatusUpdate', eventData);
+        console.log(`[WebSocket] Emitted callStatusUpdate to user ${callSession.userId}: calling`, JSON.stringify(eventData));
+      }
+
+      global.activeMediaStreams.set(callId, {
+        twilioWs,
+        openaiWs,
+        streamSid: null
+      });
+      console.log('[MediaStream] Registered connection in global map:', callId);
+
+      console.log('[SilenceDetection] Starting initial silence timer (30s) after connection');
+      customerSilenceTimer = setTimeout(() => {
+        console.log('[SilenceDetection] Initial 30 seconds of silence detected');
+
+        if (customerSilenceCheckCount === 0) {
+          console.log('[SilenceDetection] Sending first check message');
+          customerSilenceCheckCount = 1;
+
+          if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+            const systemMessage = {
+              type: 'conversation.item.create',
+              item: {
+                type: 'message',
+                role: 'user',
+                content: [{
+                  type: 'input_text',
+                  text: '[システムメッセージ] 顧客が30秒間応答していません。「もしもし、おつながりでしょうか？」と確認してください。'
+                }]
+              }
+            };
+            openaiWs.send(JSON.stringify(systemMessage));
+
+            const responseCreate = { type: 'response.create' };
+            openaiWs.send(JSON.stringify(responseCreate));
+          }
+        }
+      }, 30000);
+    });
+
+    openaiWs.on('error', (error) => {
+      console.error('[OpenAI] WebSocket error:', error.message);
+      console.error('[OpenAI] Error details:', error);
+
+      if (cartesiaWs && cartesiaWs.readyState === WebSocket.OPEN) {
+        cartesiaWs.close();
+      }
+
+      if (twilioWs && twilioWs.readyState === 1) {
+        twilioWs.close();
+      }
+    });
+
+    openaiWs.on('close', (code, reason) => {
+      console.log('[OpenAI] WebSocket closed, code:', code, 'reason:', reason?.toString());
+
+      if (handoffFallbackTimer) {
+        clearTimeout(handoffFallbackTimer);
+        handoffFallbackTimer = null;
+      }
+      if (scheduledHandoffCtxId) {
+        playback.cancelScheduledHangup(scheduledHandoffCtxId);
+        scheduledHandoffCtxId = null;
+      }
+      handoffCompleted = true;
+
+      if (cartesiaWs && cartesiaWs.readyState === WebSocket.OPEN) {
+        cartesiaWs.close();
+      }
+
+      if (twilioWs && twilioWs.readyState === 1) {
+        twilioWs.close();
+      }
+    });
+
+    openaiWs.on('message', async (data) => {
+      try {
+        const response = JSON.parse(data.toString());
+　　　　 // セッション設定（instructions/VAD）が反映された合図。
+        // ストリーム開始済みなら、AIから先に開始挨拶を出す（1回だけ）。
+      if (response.type === 'session.updated') {
+          sessionIsReady = true;
+          // A方式：つながったらAIから先に開始挨拶を出す（1回だけ）
+          if (!hasGreeted && openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+            hasGreeted = true;
+            greetingPending = true;
+            console.log('[Greeting] session.updated — AIから開始挨拶を発火');
+            openaiWs.send(JSON.stringify({ type: 'response.create' }));
+          }
+        }
+        if (response.type && response.type.includes('function') || response.type && response.type.includes('output_item')) {
+          console.log('[OpenAI DEBUG] Event type:', response.type);
+          console.log('[OpenAI DEBUG] Full response:', JSON.stringify(response, null, 2));
+        }
+
+        if (LOG_EVENT_TYPES.includes(response.type)) {
+          console.log('[OpenAI] Event:', response.type, response);
+        }
+
+        const isDeltaCandidate = (response.type === 'response.text.delta' ||
+                                  response.type === 'response.output_text.delta') && response.delta;
+        if (isDeltaCandidate) {
+          if (!textDeltaEventType) {
+            textDeltaEventType = response.type;
+            console.log('[Text] Locked delta event type:', textDeltaEventType);
+          }
+        }
+        const isTextDelta = isDeltaCandidate && response.type === textDeltaEventType;
+
+        // ✅ 転送アナウンスが確定した後に生成された別の発話は喋らせない（二重発話＝輪唱の防止）
+        if (isTextDelta && pendingHandoff && pendingHandoff.ctxId && !handoffAwaitingAnnouncementCtx &&
+            !pendingHandoff.ctxId.endsWith('-' + response.item_id)) {
+          if (!suppressCancelSent && openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+            suppressCancelSent = true;
+            try { openaiWs.send(JSON.stringify({ type: 'response.cancel' })); } catch (e) {}
+          }
+          console.log('[AutoHandoff] extra assistant speech after announcement suppressed item=' + response.item_id);
+          return;
+        }
+
+        if (isTextDelta && suppressedItemId && response.item_id === suppressedItemId) {
+          return; // 重ねないと決めた発話の続き
+        }
+
+        if (isTextDelta && response.item_id && response.item_id !== lastAssistantItem) {
+          const others = liveContexts();
+          if (others.length > 0) {
+            if (others.some(c => c.terminating || c.protectedGreeting)) {
+              // 終話・転送アナウンス再生中 → 新しい発話を捨てる
+              suppressedItemId = response.item_id;
+              try { openaiWs.send(JSON.stringify({ type: 'response.cancel' })); } catch (e) {}
+              console.warn('[Overlap] closing/handoff phrase playing — new speech suppressed item=' + response.item_id);
+              return;
+            }
+            // 通常の発話が残っている → 古い方を止めて新しい方だけを流す（二重再生＝輪唱の防止）
+            console.warn('[Overlap] previous speech still playing (' + others.map(c => c.id).join(',') + ') — stopping it before new item ' + response.item_id);
+            playback.invalidateAll('overlap');
+            if (twilioWs && twilioWs.readyState === WebSocket.OPEN && streamSid) {
+              try { twilioWs.send(JSON.stringify({ event: 'clear', streamSid })); } catch (e) {}
+            }
+          }
+        }
+
+        if (isTextDelta) {
+          if (customerSilenceTimer) {
+            clearTimeout(customerSilenceTimer);
+            customerSilenceTimer = null;
+          }
+
+          if (response.item_id && response.item_id !== lastAssistantItem) {
+            responseStartTimestamp = latestMediaTimestamp;
+            lastAssistantItem = response.item_id;
+            currentResponseId = response.response_id || `resp-${Date.now()}`;
+            cartesiaContextId = createCartesiaContextId(currentResponseId, response.item_id);
+            playback.startContext(cartesiaContextId);
+            if (greetingPending) {
+              greetingPending = false;
+              const gctx = playback.contexts.get(cartesiaContextId);
+              if (gctx) gctx.protectedGreeting = true;
+              console.log('[Greeting] 開始挨拶を保護（顧客の「もしもし」で途切れさせない） ctx=' + cartesiaContextId);
+            }
+            console.log('[Text] New assistant item:', response.item_id, '→ Cartesia context:', cartesiaContextId);
+
+            // ── フィラー挿入：顧客が直前に話した場合のみ「はい。」を挿入 ──
+            if (customerJustSpoke && !pendingHandoff && !pendingCallEnd) {
+              sendToCartesia(cartesiaWs, 'はい。', cartesiaContextId, true, cartesiaVoiceId, cartesiaSpeed);
+              console.log('[Filler] Inserted: はい。');
+              customerJustSpoke = false; // リセット
+            }
+            // ─────────────────────────────────────────────────────────────
+
+            if (pendingHandoff && handoffAwaitingAnnouncementCtx) {
+              if (scheduledHandoffCtxId && scheduledHandoffCtxId !== cartesiaContextId) {
+                playback.cancelScheduledHangup(scheduledHandoffCtxId);
+                console.log('[AutoHandoff] cancelled prior announcement ctx=' + scheduledHandoffCtxId);
+              }
+              pendingHandoff.ctxId = cartesiaContextId;
+              scheduledHandoffCtxId = cartesiaContextId;
+              playback.scheduleHangupOnDrain(cartesiaContextId, () => {
+                console.log('[AutoHandoff] audio drained — executing handoff');
+                completeHandoff('drain');
+              });
+              if (handoffFallbackTimer) {
+                clearTimeout(handoffFallbackTimer);
+                handoffFallbackTimer = null;
+              }
+              console.log('[AutoHandoff] bound and scheduled announcement ctx=' + cartesiaContextId);
+            }
+
+            if (callSession && global.io && callSession.userId) {
+              global.io.to(`user-${callSession.userId}`).emit('callStatusUpdate', {
+                customerId: callSession.customerId?.toString() || callSession.customerId,
+                phoneNumber: callSession.phoneNumber,
+                status: 'ai-responding',
+                callId: callSession._id.toString(),
+                twilioCallSid: callSession.twilioCallSid
+              });
+            }
+          }
+
+          textBuffer += response.delta;
+
+          const sentenceEnd = /[。！？!?]\s*$/.test(textBuffer) && textBuffer.length >= 8;
+          const pausePoint = /[、,]\s*$/.test(textBuffer) && textBuffer.length >= 20;
+          if (sentenceEnd || pausePoint || textBuffer.length >= 60) {
+            sendToCartesia(cartesiaWs, textBuffer, cartesiaContextId, true, cartesiaVoiceId, cartesiaSpeed);
+            textBuffer = '';
+          }
+        }
+
+        const isTextDone = response.type === 'response.text.done' ||
+                           response.type === 'response.output_text.done';
+        if (isTextDone && cartesiaContextId) {
+          // ✅ function callによるclosing phraseが既にセットされている場合はテキスト応答を無視
+          const isBoundHandoffAnnouncement = !!(pendingHandoff && pendingHandoff.ctxId &&
+                                                pendingHandoff.ctxId === cartesiaContextId);
+          if ((pendingCallEnd || pendingHandoff) && !isBoundHandoffAnnouncement) {
+            console.log('[TextDone] skipping — pendingCallEnd/Handoff already set, dropping duplicate speech');
+            textBuffer = '';
+            cartesiaContextId = null;
+          } else {
+          if (textBuffer.trim()) {
+            sendToCartesia(cartesiaWs, textBuffer, cartesiaContextId, true, cartesiaVoiceId, cartesiaSpeed);
+            textBuffer = '';
+          }
+          sendToCartesia(cartesiaWs, '', cartesiaContextId, false, cartesiaVoiceId, cartesiaSpeed);
+          lastCompletedCtxId = cartesiaContextId;
+          lastCompletedCtxResponseId = currentResponseId;
+          if (isBoundHandoffAnnouncement) handoffAwaitingAnnouncementCtx = false;
+          cartesiaContextId = null;
+          } // end else (not pendingCallEnd/Handoff)
+        }
+
+        if (response.type === 'input_audio_buffer.speech_started') {
+          console.log('[barge-in] speech_started');
+          speechStartedAt = new Date();
+          // ✅ customerHasSpokenはtranscription.completedでのみセット
+          // speech_startedはエコーや背景音でも発火するため使用しない
+
+          // ✅ closing phrase再生中（terminating context）はバージインを無効化
+          // 挨拶の途中で切れるのを防ぐ
+          const hasTerminatingContext = [...playback.contexts.values()].some(
+            ctx => ctx.terminating && !ctx.invalidated
+          );
+          if (hasTerminatingContext) {
+            console.log('[barge-in] closing phrase in progress — ignoring speech_started');
+            return;
+          }
+          if (greetingPending || greetingPlaying()) {
+            console.log('[barge-in] 開始挨拶の再生中 — 割り込まずに最後まで話す');
+            return;
+          }
+
+          const shouldInterrupt =
+            playback.isAiResponseActive() ||
+            !!cartesiaContextId;
+
+          textBuffer = '';
+
+          if (customerSilenceTimer) {
+            clearTimeout(customerSilenceTimer);
+            customerSilenceTimer = null;
+            customerSilenceCheckCount = 0;
+          }
+
+          if (!shouldInterrupt) {
+            console.log('[barge-in] nothing to interrupt (idle)');
+            return;
+          }
+
+          // ✅ 仮バージイン：AIを止めるがtranscription確認まで「ノイズかも」として保留
+          pendingBargeIn = true;
+          bargeInSavedText = textBuffer;
+          bargeInSavedCtxId = cartesiaContextId;
+
+          if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+            try {
+              openaiWs.send(JSON.stringify({ type: 'response.cancel' }));
+              console.log('[barge-in] openai response.cancel sent (pending confirmation)');
+            } catch (e) {
+              console.error('[barge-in] openai response.cancel error:', e.message);
+            }
+          }
+
+          if (cartesiaContextId) {
+            try {
+              sendToCartesia(cartesiaWs, '', cartesiaContextId, false);
+            } catch (e) {
+              console.error('[barge-in] cartesia finalize error:', e.message);
+            }
+          }
+          playback.invalidateAll('speech_started');
+          console.log('[barge-in] cartesia context invalidated (pending noise check)');
+
+          if (twilioWs && twilioWs.readyState === WebSocket.OPEN && streamSid) {
+            try {
+              twilioWs.send(JSON.stringify({ event: 'clear', streamSid }));
+              console.log('[barge-in] twilio clear sent');
+            } catch (e) {
+              console.error('[barge-in] twilio clear error:', e.message);
+            }
+          }
+
+          if (pendingHandoff) {
+            if (!pendingHandoff.ctxId) {
+              console.log('[barge-in] dropping pendingHandoff (announcement not started)');
+              if (pendingHandoff.earlyDial) {
+                cancelEarlyHandoffDial(pendingHandoff.earlyDial, 'barge-in before announcement')
+                  .catch(err => console.error('[EarlyDial] cancel error:', err.message));
+                activeEarlyDial = null;
+              }
+              pendingHandoff = null;
+              handoffAwaitingAnnouncementCtx = false;
+              if (handoffFallbackTimer) {
+                clearTimeout(handoffFallbackTimer);
+                handoffFallbackTimer = null;
+              }
+            } else {
+              console.log('[barge-in] handoff announcement live — terminating-guard will complete handoff, not aborting');
+            }
+          }
+          if (pendingCallEnd) {
+            console.log('[barge-in] dropping pendingCallEnd due to user speech');
+            pendingCallEnd = null;
+          }
+
+          cartesiaContextId = null;
+          lastAssistantItem = null;
+          responseStartTimestamp = null;
+        }
+
+        if (response.type === 'input_audio_buffer.committed' && response.item_id) {
+          console.log('[Conversation] User speech committed:', response.item_id);
+        }
+
+        if (response.type === 'conversation.item.input_audio_transcription.completed') {
+          const transcript = response.transcript;
+          const itemId = response.item_id;
+
+          console.log('[User Transcription] Completed:', { itemId, transcript });
+
+          // ✅ ノイズ判定：transcriptが空または1文字以下 → バージインを取り消してAI発話を再開
+          const isNoise = !transcript || transcript.trim().length <= 1;
+          if (pendingBargeIn && isNoise) {
+            console.log('[barge-in] noise detected (transcript empty/too short), resuming AI speech');
+            pendingBargeIn = false;
+
+            // AI発話を再開：中断したテキストから続きを送信
+            if (bargeInSavedText && bargeInSavedText.trim()) {
+              const resumeCtxId = createCartesiaContextId('resume', Date.now().toString());
+              playback.startContext(resumeCtxId);
+              cartesiaContextId = resumeCtxId;
+              sendToCartesia(cartesiaWs, bargeInSavedText, resumeCtxId, false, cartesiaVoiceId, cartesiaSpeed);
+              console.log('[barge-in] resumed AI speech from saved buffer');
+            } else {
+              // テキストバッファが空（AIの発話が終わっていた）→ 沈黙タイマーを再スタート
+              if (!pendingHandoff && !pendingCallEnd) {
+                if (customerSilenceTimer) clearTimeout(customerSilenceTimer);
+                customerSilenceCheckCount = 0;
+                // onDrainで自動的にタイマーが始まるので何もしなくてよい
+              }
+            }
+            bargeInSavedText = '';
+            bargeInSavedCtxId = null;
+            speechStartedAt = null;
+            return; // ここで終了（以降の処理をスキップ）
+          }
+
+          // 本物の発話 → 仮バージインを確定
+          pendingBargeIn = false;
+          bargeInSavedText = '';
+          bargeInSavedCtxId = null;
+
+          if (transcript && transcript.length > 0) {
+            // ── 顧客が話したフラグをセット ──
+            customerJustSpoke = true;
+            customerHasSpoken = true;
+
+            callSession.realtimeConversation.push({
+              type: 'message',
+              role: 'user',
+              content: [{ type: 'input_audio', transcript }],
+              timestamp: new Date()
+            });
+
+            await callSession.save();
+            console.log('[User Transcription] Saved to database');
+
+            sendConversationUpdate(callSession, 'user', transcript, speechStartedAt || new Date());
+            speechStartedAt = null;
+          }
+        }
+
+        if (response.type === 'conversation.item.created' && response.item) {
+          const item = response.item;
+          console.log('[Conversation] Item created:', {
+            id: item.id,
+            type: item.type,
+            role: item.role,
+            hasContent: !!item.content
+          });
+
+          if (item.role && item.content && item.content.length > 0) {
+            callSession.realtimeConversation.push({
+              type: item.type || 'message',
+              role: item.role,
+              content: item.content,
+              timestamp: new Date()
+            });
+
+            await callSession.save();
+            console.log('[Conversation] Saved item (conversation.item.created), role:', item.role, 'total:', callSession.realtimeConversation.length);
+          }
+        }
+
+        if (response.type === 'response.done' && response.response) {
+          const resp = response.response;
+
+          if (resp.output && resp.output.length > 0) {
+            for (const item of resp.output) {
+              if (item.role && item.content) {
+                console.log('[Conversation] Saving assistant item:', {
+                  role: item.role,
+                  contentLength: item.content.length,
+                  type: item.type
+                });
+
+                callSession.realtimeConversation.push({
+                  type: item.type || 'message',
+                  role: item.role,
+                  content: item.content,
+                  timestamp: new Date()
+                });
+
+                const text = extractTextFromContent(item.content);
+                console.log('[Conversation] Extracted text:', text || '(empty)', 'from content types:', item.content.map(c => c.type).join(', '));
+                if (text) {
+                  sendConversationUpdate(callSession, item.role, text);
+                }
+              }
+            }
+
+            await callSession.save();
+            console.log('[Conversation] Saved to database, total items:', callSession.realtimeConversation.length);
+          }
+
+          // ✅ 沈黙タイマーはCartesia再生完了後(onDrain)に開始するため、
+          //    response.done時点では前のタイマーをクリアするだけ
+          if (!pendingHandoff && !pendingCallEnd) {
+            if (customerSilenceTimer) {
+              clearTimeout(customerSilenceTimer);
+              customerSilenceTimer = null;
+              console.log('[SilenceDetection] response.done: 前のタイマーをクリア（Cartesia drain後に再スタート）');
+            }
+          }
+
+          if (pendingHandoff) {
+            const ctxId = pendingHandoff.ctxId;
+            if (!ctxId && !handoffAnnouncementRequested && openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+              handoffAnnouncementRequested = true;
+              console.log('[AutoHandoff] no announcement in this turn — requesting one');
+              openaiWs.send(JSON.stringify({ type: 'response.create' }));
+            } else if (!ctxId || lastCompletedCtxId !== ctxId) {
+              console.log('[AutoHandoff] response.done but announcement ctx not finalized yet (ctxId=' + ctxId + ', lastCompleted=' + lastCompletedCtxId + ') — waiting');
+            } else {
+              handoffAwaitingAnnouncementCtx = false;
+              console.log('[AutoHandoff] announcement finalized — drain completion already scheduled ctx=' + ctxId);
+            }
+          }
+
+          if (pendingCallEnd) {
+            console.warn('[AutoCallEnd] legacy pendingCallEnd path triggered — falling back to deterministic close');
+            const endData = pendingCallEnd;
+            pendingCallEnd = null;
+            const ctxId = lastCompletedCtxId;
+            const run = async () => {
+              try {
+                if (endData.type === 'no_response' || endData.type === 'voicemail') {
+                  await executeAutoCallEndOnNoResponse(callSession, endData.callId, endData.args, endData.type);
+                } else if (endData.type === 'absent') {
+                  await executeAutoCallEndOnAbsent(callSession, endData.callId, endData.args);
+                } else {
+                  await executeAutoCallEnd(callSession, endData.callId, endData.args);
+                }
+              } catch (err) {
+                console.error('[AutoCallEnd] Error execution:', err);
+              }
+            };
+            if (!ctxId) {
+              run();
+            } else {
+              playback.scheduleHangupOnDrain(ctxId, run);
+            }
+          }
+        }
+
+        if (response.type === 'response.output_item.done' && response.item) {
+          const item = response.item;
+          console.log('[FunctionCall] Detected output_item.done:', item.type);
+
+          if (item.type === 'function_call' && item.name === 'transfer_to_human') {
+            console.log('[FunctionCall] Transfer function called by AI');
+            console.log('[FunctionCall] Arguments:', item.arguments);
+
+            try {
+              const args = JSON.parse(item.arguments);
+              // ✅ 先行発信：アナウンスの再生完了を待たず、この時点で担当者の電話を鳴らし始める
+              //    （同じ通話で2回目の関数呼び出しが来ても、発信は1回だけにする）
+              if (!activeEarlyDial || activeEarlyDial.cancelled) {
+                activeEarlyDial = startEarlyHandoffDial(callSession, args);
+              }
+              pendingHandoff = {
+                callId: item.call_id,
+                args: args,
+                ctxId: null,
+                earlyDial: activeEarlyDial
+              };
+              handoffAwaitingAnnouncementCtx = true;
+              handoffAnnouncementRequested = false;
+              suppressCancelSent = false;
+
+              // ✅ 同じターンで既に転送アナウンスを喋っていれば、それに紐付ける
+              const fnResponseId = response.response_id;
+              let sameTurnCtx = null;
+              if (cartesiaContextId && currentResponseId === fnResponseId) {
+                sameTurnCtx = cartesiaContextId;            // まだテキスト生成中
+              } else if (lastCompletedCtxId && lastCompletedCtxResponseId === fnResponseId) {
+                sameTurnCtx = lastCompletedCtxId;           // テキスト生成は完了、再生中 or 再生済み
+              }
+
+              if (handoffFallbackTimer) clearTimeout(handoffFallbackTimer);
+              if (sameTurnCtx) {
+                pendingHandoff.ctxId = sameTurnCtx;
+                scheduledHandoffCtxId = sameTurnCtx;
+                if (sameTurnCtx !== cartesiaContextId) handoffAwaitingAnnouncementCtx = false;
+                playback.scheduleHangupOnDrain(sameTurnCtx, () => {
+                  console.log('[AutoHandoff] audio drained — executing handoff');
+                  completeHandoff('drain');
+                });
+                console.log('[AutoHandoff] bound to same-turn announcement ctx=' + sameTurnCtx + ' (no extra response.create)');
+              } else {
+                handoffFallbackTimer = setTimeout(() => {
+                  if (!handoffCompleted) {
+                    console.warn('[AutoHandoff] announcement did not complete within fallback window — executing handoff directly');
+                    completeHandoff('fallback-timeout');
+                  }
+                }, HANDOFF_ANNOUNCE_FALLBACK_MS);
+              }
+
+              if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+                const functionOutput = {
+                  type: 'conversation.item.create',
+                  item: {
+                    type: 'function_call_output',
+                    call_id: item.call_id,
+                    output: JSON.stringify({
+                      success: true,
+                      message: '転送準備が整いました。お客様にご案内後、転送を実行します。'
+                    })
+                  }
+                };
+                openaiWs.send(JSON.stringify(functionOutput));
+                console.log('[FunctionCall] Sent function result to OpenAI (handoff pending)');
+                // ✅ ここでは response.create を送らない（送ると同じアナウンスをもう一度生成し、二重発話になる）
+                //    アナウンス無しで関数だけ呼ばれた場合は response.done で1回だけ要求する
+              }
+            } catch (error) {
+              console.error('[FunctionCall] Error parsing function arguments:', error);
+              pendingHandoff = null;
+              handoffAwaitingAnnouncementCtx = false;
+              if (handoffFallbackTimer) {
+                clearTimeout(handoffFallbackTimer);
+                handoffFallbackTimer = null;
+              }
+
+              if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+                const functionOutput = {
+                  type: 'conversation.item.create',
+                  item: {
+                    type: 'function_call_output',
+                    call_id: item.call_id,
+                    output: JSON.stringify({
+                      success: false,
+                      message: '転送準備に失敗しました',
+                      error: error.message
+                    })
+                  }
+                };
+                openaiWs.send(JSON.stringify(functionOutput));
+              }
+            }
+          }
+
+          else if (item.type === 'function_call' && item.name === 'end_call_on_rejection') {
+            console.log('[FunctionCall] 顧客拒否検知 - deterministic closing で切電');
+            handleDeterministicCallEnd({
+              endType: 'rejection',
+              phrase: CLOSING_PHRASES.rejection,
+              item,
+              openaiWs,
+              cartesiaWs,
+              playback,
+              executor: (callId, args) => executeAutoCallEnd(callSession, callId, args),
+              voiceId: cartesiaVoiceId,
+              onTranscript: (text) => sendConversationUpdate(callSession, 'assistant', text)
+            });
+          }
+
+          else if (item.type === 'function_call' && item.name === 'end_call_on_voicemail') {
+            console.log('[FunctionCall] 留守番電話検知 - silent close で切電');
+            handleDeterministicCallEnd({
+              endType: 'voicemail',
+              phrase: CLOSING_PHRASES.voicemail,
+              item,
+              openaiWs,
+              cartesiaWs,
+              playback,
+              executor: (callId, args) =>
+                executeAutoCallEndOnNoResponse(callSession, callId, args, 'voicemail'),
+              voiceId: cartesiaVoiceId,
+              onTranscript: (text) => sendConversationUpdate(callSession, 'assistant', text)
+            });
+          }
+
+          else if (item.type === 'function_call' && item.name === 'end_call_on_no_response') {
+            console.log('[FunctionCall] 顧客無応答検知 - deterministic closing で切電');
+            handleDeterministicCallEnd({
+              endType: 'no_response',
+              phrase: CLOSING_PHRASES.no_response,
+              item,
+              openaiWs,
+              cartesiaWs,
+              playback,
+              executor: (callId, args) =>
+                executeAutoCallEndOnNoResponse(callSession, callId, args, 'no_response'),
+              voiceId: cartesiaVoiceId,
+              onTranscript: (text) => sendConversationUpdate(callSession, 'assistant', text)
+            });
+          }
+
+          else if (item.type === 'function_call' && item.name === 'end_call_on_absent') {
+            console.log('[FunctionCall] 担当者不在検知 - deterministic closing で切電');
+            handleDeterministicCallEnd({
+              endType: 'absent',
+              phrase: CLOSING_PHRASES.absent,
+              item,
+              openaiWs,
+              cartesiaWs,
+              playback,
+              executor: (callId, args) =>
+                executeAutoCallEndOnAbsent(callSession, callId, args),
+              voiceId: cartesiaVoiceId,
+              onTranscript: (text) => sendConversationUpdate(callSession, 'assistant', text)
+            });
+          }
+        }
+
+      } catch (error) {
+        console.error('[OpenAI] Error processing message:', error.message);
+      }
+    });
+
+  } catch (error) {
+    console.error('[MediaStream] Error in handleMediaStream:', error.message);
+    console.error('[MediaStream] Stack:', error.stack);
+
+    if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+      openaiWs.close();
+    }
+    if (cartesiaWs && cartesiaWs.readyState === WebSocket.OPEN) {
+      cartesiaWs.close();
+    }
+    twilioWs.close();
+  }
+};
+
+exports.executeAutoCallEnd = executeAutoCallEnd;
+exports.executeAutoCallEndOnNoResponse = executeAutoCallEndOnNoResponse;
+exports.executeAutoCallEndOnAbsent = executeAutoCallEndOnAbsent;
+exports.executeAutoHandoff = executeAutoHandoff;
+exports.startEarlyHandoffDial = startEarlyHandoffDial;
+exports.cancelEarlyHandoffDial = cancelEarlyHandoffDial;
+exports.finishEarlyHandoff = finishEarlyHandoff;
+
+module.exports = exports;
